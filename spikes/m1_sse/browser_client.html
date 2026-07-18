@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>M1 SSE Spike</title>
+    <style>
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        margin: 32px;
+        max-width: 880px;
+      }
+      button,
+      input {
+        font: inherit;
+        margin-right: 8px;
+        padding: 8px 10px;
+      }
+      pre {
+        background: #111827;
+        color: #e5e7eb;
+        min-height: 260px;
+        padding: 16px;
+        white-space: pre-wrap;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>M1 SSE Spike</h1>
+    <p>FastAPI POST stream consumed with fetch and ReadableStream.</p>
+    <input id="message" value="Skillvar SSE 流式测试" size="36" />
+    <button id="start">Start</button>
+    <button id="error">Error</button>
+    <button id="cancel">Client Cancel</button>
+    <pre id="log"></pre>
+
+    <script>
+      let controller = null;
+
+      function log(value) {
+        document.querySelector("#log").textContent += value + "\n";
+      }
+
+      function parseFrames(buffer, onEvent) {
+        let boundary = buffer.indexOf("\n\n");
+        while (boundary !== -1) {
+          const frame = buffer.slice(0, boundary);
+          buffer = buffer.slice(boundary + 2);
+          const event = { event: "message", data: "" };
+          for (const line of frame.split("\n")) {
+            if (line.startsWith("event:")) event.event = line.slice(6).trim();
+            if (line.startsWith("data:")) event.data += line.slice(5).trim();
+          }
+          if (event.data) event.data = JSON.parse(event.data);
+          onEvent(event);
+          boundary = buffer.indexOf("\n\n");
+        }
+        return buffer;
+      }
+
+      async function run(mode) {
+        controller = new AbortController();
+        document.querySelector("#log").textContent = "";
+        const payload = {
+          message: document.querySelector("#message").value,
+          chunks: 8,
+          delay_ms: 100,
+        };
+        if (mode === "error") payload.fail_at = 2;
+        const response = await fetch("/stream", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+          signal: controller.signal,
+        });
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          buffer = parseFrames(buffer, (event) => log(`${event.event}: ${JSON.stringify(event.data)}`));
+        }
+      }
+
+      document.querySelector("#start").onclick = () => run("normal").catch((error) => log(error.name));
+      document.querySelector("#error").onclick = () => run("error").catch((error) => log(error.name));
+      document.querySelector("#cancel").onclick = () => {
+        if (controller) controller.abort();
+      };
+    </script>
+  </body>
+</html>

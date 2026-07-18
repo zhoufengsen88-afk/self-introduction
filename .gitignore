@@ -1,0 +1,41 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+node_modules/
+.next/
+*.tsbuildinfo
+out/
+dist/
+coverage/
+*.log
+/tmp/
+*.zip
+*.tar.gz
+*.tgz
+
+# Local handoff / private source-review notes. Public RAG only loads
+# knowledge files with visibility=public and status=published, but these
+# files should also stay out of public GitHub repositories.
+docs/HANDOFF.md
+knowledge/projects/*/source-review.md
+
+# Private runtime knowledge corpus. The public repository ships only code,
+# docs, and reusable templates. Keep real resumes/project knowledge local.
+knowledge/profile/
+knowledge/resume/
+knowledge/projects/*
+!knowledge/projects/_template/
+!knowledge/projects/_template/*.md
+
+# Evaluation datasets/results often contain facts and citations derived from a
+# private corpus, so keep them local by default.
+evals/datasets/*.jsonl
+evals/results/*.json
