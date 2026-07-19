@@ -1,22 +1,29 @@
 import asyncio
+import json
 import logging
 import re
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
+from decimal import Decimal
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, cast
 from uuid import uuid4
 
-from self_intro_api.core.observability import RagTrace, TraceSink
+from self_intro_api.core.observability import ObservedSpan, RagTrace, TraceSink
 from self_intro_api.knowledge.loader import load_public_corpus
 from self_intro_api.knowledge.models import Corpus, SearchResult
 from self_intro_api.knowledge.retrieval import BM25Retriever
 from self_intro_api.knowledge.scope import KnowledgeScope, ProjectKnowledge, build_knowledge_scope
-from self_intro_api.llm.base import LLMProvider
+from self_intro_api.llm.base import (
+    LLMMessage,
+    LLMProvider,
+    LLMUsage,
+    LLMUsageStreamingProvider,
+)
 from self_intro_api.rag.context import build_rag_messages
 from self_intro_api.rag.perspective import wants_first_person_response
-from self_intro_api.schemas.chat import ChatRequest, ChatResponse, Citation
+from self_intro_api.schemas.chat import ChatDebugInfo, ChatRequest, ChatResponse, Citation
 
 RESTRICTED_PATTERNS = ("忽略之前的规则", "系统提示词", "数据库连接", "private 文档", "密钥")
 LLM_PROVIDER_ERROR_MESSAGE = "大模型调用失败，请检查 LLM 配置或稍后重试。"
@@ -112,9 +119,25 @@ class DeterministicAnswerGenerator:
             await asyncio.sleep(0)
 
 
+@dataclass
+class AnswerGenerationObservation:
+    messages: list[LLMMessage] = field(default_factory=list)
+    used_llm: bool = False
+    used_policy_answer: bool = False
+    model_name: str | None = None
+    usage: LLMUsage = field(default_factory=LLMUsage)
+
+
 class LLMAnswerGenerator:
-    def __init__(self, provider: LLMProvider):
+    def __init__(
+        self,
+        provider: LLMProvider,
+        prompt_cost_per_1k: float = 0.0,
+        completion_cost_per_1k: float = 0.0,
+    ):
         self.provider = provider
+        self.prompt_cost_per_1k = Decimal(str(prompt_cost_per_1k))
+        self.completion_cost_per_1k = Decimal(str(completion_cost_per_1k))
 
     async def generate_text(
         self,
@@ -122,11 +145,32 @@ class LLMAnswerGenerator:
         intent: RetrievalIntent,
         results: Sequence[SearchResult],
     ) -> str:
-        chunks = [chunk async for chunk in self.stream_text(request, intent, results)]
+        answer, _observation = await self.generate_text_with_observation(request, intent, results)
+        return answer
+
+    async def generate_text_with_observation(
+        self,
+        request: ChatRequest,
+        intent: RetrievalIntent,
+        results: Sequence[SearchResult],
+    ) -> tuple[str, AnswerGenerationObservation]:
+        observation = AnswerGenerationObservation()
+        chunks = [
+            chunk
+            async for chunk in self.stream_text_with_observation(
+                request,
+                intent,
+                results,
+                observation,
+            )
+        ]
         answer = "".join(chunks).strip()
         if answer:
-            return answer
-        return "模型没有返回可用内容；当前无法基于公开知识库生成可靠回答。"
+            return answer, observation
+        fallback = "模型没有返回可用内容；当前无法基于公开知识库生成可靠回答。"
+        if observation.used_llm and observation.usage.total_tokens == 0:
+            observation.usage = _estimate_llm_usage(observation.messages, fallback)
+        return fallback, observation
 
     async def stream_text(
         self,
@@ -134,21 +178,79 @@ class LLMAnswerGenerator:
         intent: RetrievalIntent,
         results: Sequence[SearchResult],
     ) -> AsyncIterator[str]:
+        observation = AnswerGenerationObservation()
+        async for piece in self.stream_text_with_observation(
+            request,
+            intent,
+            results,
+            observation,
+        ):
+            yield piece
+
+    async def stream_text_with_observation(
+        self,
+        request: ChatRequest,
+        intent: RetrievalIntent,
+        results: Sequence[SearchResult],
+        observation: AnswerGenerationObservation,
+    ) -> AsyncIterator[str]:
         policy_answer = _grounded_policy_answer(intent, request.message)
         if policy_answer:
+            observation.used_policy_answer = True
             for piece in _stream_chunks(policy_answer):
                 yield piece
                 await asyncio.sleep(0)
             return
 
         emitted = False
+        emitted_parts: list[str] = []
         messages = build_rag_messages(request, intent.name, results)
-        async for piece in self.provider.stream_chat(messages):
-            if piece:
-                emitted = True
-                yield piece
+        observation.messages = list(messages)
+        observation.used_llm = True
+        observation.model_name = self._provider_model_name()
+        usage_stream = self._usage_stream()
+        if usage_stream is not None:
+            async for chunk in usage_stream.stream_chat_with_usage(messages):
+                if chunk.usage is not None:
+                    observation.usage = chunk.usage
+                if chunk.content:
+                    emitted = True
+                    emitted_parts.append(chunk.content)
+                    yield chunk.content
+        else:
+            async for piece in self.provider.stream_chat(messages):
+                if piece:
+                    emitted = True
+                    emitted_parts.append(piece)
+                    yield piece
         if not emitted:
-            yield "模型没有返回可用内容；当前无法基于公开知识库生成可靠回答。"
+            fallback = "模型没有返回可用内容；当前无法基于公开知识库生成可靠回答。"
+            emitted_parts.append(fallback)
+            yield fallback
+        if observation.usage.total_tokens == 0:
+            observation.usage = _estimate_llm_usage(
+                messages,
+                "".join(emitted_parts),
+            )
+
+    def calculate_cost(self, usage: LLMUsage) -> Decimal:
+        prompt_cost = (Decimal(usage.prompt_tokens) / Decimal("1000")) * self.prompt_cost_per_1k
+        completion_cost = (
+            Decimal(usage.completion_tokens) / Decimal("1000")
+        ) * self.completion_cost_per_1k
+        return (prompt_cost + completion_cost).quantize(Decimal("0.000001"))
+
+    def _provider_model_name(self) -> str | None:
+        if hasattr(self.provider, "model"):
+            value = cast(Any, self.provider).model
+            if isinstance(value, str) and value:
+                return value
+        return None
+
+    def _usage_stream(self) -> LLMUsageStreamingProvider | None:
+        if hasattr(self.provider, "stream_chat_with_usage"):
+            return cast(LLMUsageStreamingProvider, self.provider)
+        return None
 
 
 def _grounded_policy_answer(intent: RetrievalIntent, question: str) -> str | None:
@@ -220,10 +322,24 @@ class RagService:
 
     def intent(self, request: ChatRequest) -> RetrievalIntent:
         """Return the observable retrieval intent selected for a knowledge request."""
-        history_text = _history_text(request)
-        project = self.knowledge_scope.match_project(f"{history_text} {request.message}")
+        current_project = self.knowledge_scope.match_project(request.message)
+        should_use_history = self._should_use_history_for_current_question(request)
+        history_text = _history_text(request) if should_use_history else ""
+        project = current_project
+        if project is None and should_use_history:
+            project = self.knowledge_scope.match_project(history_text)
         intent = _infer_intent(request.message, history_text, project)
         return _scope_intent_to_project(intent, project)
+
+    def _should_use_history_for_current_question(self, request: ChatRequest) -> bool:
+        normalized = _normalize_query(request.message)
+        has_current_project = self.knowledge_scope.match_project(request.message) is not None
+        return not has_current_project and _is_contextual_followup(request.message, normalized)
+
+    def _request_for_generation(self, request: ChatRequest) -> ChatRequest:
+        if self._should_use_history_for_current_question(request):
+            return request
+        return request.model_copy(update={"history": []})
 
     async def answer(
         self,
@@ -233,12 +349,75 @@ class RagService:
     ) -> ChatResponse:
         started = perf_counter()
         active_trace_id = trace_id or uuid4().hex
+        parent_span_id = _span_id(active_trace_id, "agent-root")
+        spans: list[ObservedSpan] = []
+
+        route_started = perf_counter()
         route = self.route(request)
-        intent = self.intent(request) if route == "knowledge_rag" else None
+        spans.append(
+            _observed_span(
+                active_trace_id,
+                "agent-route",
+                "agent",
+                "Agent Step：路由判断",
+                input=_json_payload(
+                    {
+                        "message": request.message,
+                        "history": _history_payload(request),
+                    }
+                ),
+                output=route,
+                latency_ms=_elapsed_ms(route_started),
+                metadata={"route": route},
+                parent_span_id=parent_span_id,
+            )
+        )
+
+        intent: RetrievalIntent | None = None
+        if route == "knowledge_rag":
+            intent_started = perf_counter()
+            intent = self.intent(request)
+            spans.append(
+                _observed_span(
+                    active_trace_id,
+                    "agent-intent",
+                    "agent",
+                    "Agent Step：意图识别",
+                    input=request.message,
+                    output=_json_payload(_intent_payload(intent)),
+                    latency_ms=_elapsed_ms(intent_started),
+                    metadata={"intent": intent.name, "project_id": intent.project_id},
+                    parent_span_id=parent_span_id,
+                )
+            )
         try:
-            prepared = self._prepare_answer(request, top_k)
-        except Exception:
+            prepared = self._prepare_answer(
+                request,
+                top_k,
+                route=route,
+                intent=intent,
+                trace_id=active_trace_id,
+                parent_span_id=parent_span_id,
+                spans=spans,
+            )
+        except Exception as exc:
+            spans.append(
+                _observed_span(
+                    active_trace_id,
+                    "agent-error",
+                    "agent",
+                    "Agent Step：RAG 管道异常",
+                    input=request.message,
+                    output=None,
+                    status="error",
+                    latency_ms=_elapsed_ms(started),
+                    metadata={"route": route, "intent": intent.name if intent else None},
+                    parent_span_id=parent_span_id,
+                    error_message=str(exc),
+                )
+            )
             self._record_trace(
+                request=request,
                 trace_id=active_trace_id,
                 route=route,
                 intent=intent,
@@ -248,10 +427,27 @@ class RagService:
                 streaming=False,
                 first_token_ms=None,
                 error_code="rag_pipeline_error",
+                spans=spans,
+                parent_span_id=parent_span_id,
             )
             raise
         if isinstance(prepared, ChatResponse):
+            prepared = prepared.model_copy(
+                update={
+                    "debug": self._debug_info(
+                        trace_id=active_trace_id,
+                        route=route,
+                        intent=intent,
+                        results=(),
+                        response=prepared,
+                        started=started,
+                        first_token_ms=None,
+                        spans=spans,
+                    )
+                }
+            )
             self._record_trace(
+                request=request,
                 trace_id=active_trace_id,
                 route=route,
                 intent=intent,
@@ -261,45 +457,120 @@ class RagService:
                 streaming=False,
                 first_token_ms=None,
                 error_code=None,
+                spans=spans,
+                parent_span_id=parent_span_id,
             )
             return prepared
 
+        generation_observation = AnswerGenerationObservation()
+        generation_started = perf_counter()
+        generation_request = self._request_for_generation(request)
         try:
-            answer = await self.answer_generator.generate_text(
-                request=request,
-                intent=prepared.intent,
-                results=prepared.results,
-            )
-        except Exception:
+            if isinstance(self.answer_generator, LLMAnswerGenerator):
+                answer, generation_observation = (
+                    await self.answer_generator.generate_text_with_observation(
+                        request=generation_request,
+                        intent=prepared.intent,
+                        results=prepared.results,
+                    )
+                )
+            else:
+                answer = await self.answer_generator.generate_text(
+                    request=generation_request,
+                    intent=prepared.intent,
+                    results=prepared.results,
+                )
+        except Exception as exc:
             response = ChatResponse(
                 answer=LLM_PROVIDER_ERROR_MESSAGE,
                 citations=[],
                 refused=True,
                 refusal_reason="llm_provider_error",
             )
+            spans.extend(
+                self._answer_generation_spans(
+                    trace_id=active_trace_id,
+                    parent_span_id=parent_span_id,
+                    request=request,
+                    intent=prepared.intent,
+                    results=prepared.results,
+                    answer=response.answer,
+                    observation=generation_observation,
+                    generation_latency_ms=_elapsed_ms(generation_started),
+                    status="error",
+                    error_message=str(exc),
+                )
+            )
+            response = response.model_copy(
+                update={
+                    "debug": self._debug_info(
+                        trace_id=active_trace_id,
+                        route=route,
+                        intent=prepared.intent,
+                        results=prepared.results,
+                        response=response,
+                        started=started,
+                        first_token_ms=None,
+                        spans=spans,
+                        error_code="llm_provider_error",
+                    )
+                }
+            )
             self._record_trace(
+                request=request,
                 trace_id=active_trace_id,
                 route=route,
-                intent=intent,
+                intent=prepared.intent,
                 results=prepared.results,
                 response=response,
                 started=started,
                 streaming=False,
                 first_token_ms=None,
                 error_code="llm_provider_error",
+                spans=spans,
+                parent_span_id=parent_span_id,
             )
             return response
         response = ChatResponse(answer=answer, citations=prepared.citations)
+        spans.extend(
+            self._answer_generation_spans(
+                trace_id=active_trace_id,
+                parent_span_id=parent_span_id,
+                request=request,
+                intent=prepared.intent,
+                results=prepared.results,
+                answer=answer,
+                observation=generation_observation,
+                generation_latency_ms=_elapsed_ms(generation_started),
+            )
+        )
+        response = response.model_copy(
+            update={
+                "debug": self._debug_info(
+                    trace_id=active_trace_id,
+                    route=route,
+                    intent=prepared.intent,
+                    results=prepared.results,
+                    response=response,
+                    started=started,
+                    first_token_ms=None,
+                    spans=spans,
+                )
+            }
+        )
         self._record_trace(
+            request=request,
             trace_id=active_trace_id,
             route=route,
-            intent=intent,
+            intent=prepared.intent,
             results=prepared.results,
             response=response,
             started=started,
             streaming=False,
             first_token_ms=None,
             error_code=None,
+            spans=spans,
+            parent_span_id=parent_span_id,
         )
         return response
 
@@ -311,13 +582,76 @@ class RagService:
     ) -> AsyncIterator[dict[str, Any]]:
         started = perf_counter()
         active_trace_id = trace_id or uuid4().hex
+        parent_span_id = _span_id(active_trace_id, "agent-root")
+        spans: list[ObservedSpan] = []
+
+        route_started = perf_counter()
         route = self.route(request)
-        intent = self.intent(request) if route == "knowledge_rag" else None
+        spans.append(
+            _observed_span(
+                active_trace_id,
+                "agent-route",
+                "agent",
+                "Agent Step：路由判断",
+                input=_json_payload(
+                    {
+                        "message": request.message,
+                        "history": _history_payload(request),
+                    }
+                ),
+                output=route,
+                latency_ms=_elapsed_ms(route_started),
+                metadata={"route": route},
+                parent_span_id=parent_span_id,
+            )
+        )
+
+        intent: RetrievalIntent | None = None
+        if route == "knowledge_rag":
+            intent_started = perf_counter()
+            intent = self.intent(request)
+            spans.append(
+                _observed_span(
+                    active_trace_id,
+                    "agent-intent",
+                    "agent",
+                    "Agent Step：意图识别",
+                    input=request.message,
+                    output=_json_payload(_intent_payload(intent)),
+                    latency_ms=_elapsed_ms(intent_started),
+                    metadata={"intent": intent.name, "project_id": intent.project_id},
+                    parent_span_id=parent_span_id,
+                )
+            )
         first_token_ms: float | None = None
         try:
-            prepared = self._prepare_answer(request, top_k)
-        except Exception:
+            prepared = self._prepare_answer(
+                request,
+                top_k,
+                route=route,
+                intent=intent,
+                trace_id=active_trace_id,
+                parent_span_id=parent_span_id,
+                spans=spans,
+            )
+        except Exception as exc:
+            spans.append(
+                _observed_span(
+                    active_trace_id,
+                    "agent-error",
+                    "agent",
+                    "Agent Step：RAG 管道异常",
+                    input=request.message,
+                    output=None,
+                    status="error",
+                    latency_ms=_elapsed_ms(started),
+                    metadata={"route": route, "intent": intent.name if intent else None},
+                    parent_span_id=parent_span_id,
+                    error_message=str(exc),
+                )
+            )
             self._record_trace(
+                request=request,
                 trace_id=active_trace_id,
                 route=route,
                 intent=intent,
@@ -327,6 +661,8 @@ class RagService:
                 streaming=True,
                 first_token_ms=None,
                 error_code="rag_pipeline_error",
+                spans=spans,
+                parent_span_id=parent_span_id,
             )
             raise
         if isinstance(prepared, ChatResponse):
@@ -336,8 +672,28 @@ class RagService:
                     first_token_ms = (perf_counter() - started) * 1000
                 yield {"event": "delta", "data": {"content": piece}}
                 await asyncio.sleep(0)
-            yield _done_event(response.citations, response.refused, response.refusal_reason)
+            response = response.model_copy(
+                update={
+                    "debug": self._debug_info(
+                        trace_id=active_trace_id,
+                        route=route,
+                        intent=intent,
+                        results=(),
+                        response=response,
+                        started=started,
+                        first_token_ms=first_token_ms,
+                        spans=spans,
+                    )
+                }
+            )
+            yield _done_event(
+                response.citations,
+                response.refused,
+                response.refusal_reason,
+                response.debug,
+            )
             self._record_trace(
+                request=request,
                 trace_id=active_trace_id,
                 route=route,
                 intent=intent,
@@ -347,21 +703,52 @@ class RagService:
                 streaming=True,
                 first_token_ms=first_token_ms,
                 error_code=None,
+                spans=spans,
+                parent_span_id=parent_span_id,
             )
             return
 
+        answer_parts: list[str] = []
+        generation_observation = AnswerGenerationObservation()
+        generation_started = perf_counter()
+        generation_request = self._request_for_generation(request)
         try:
-            async for piece in self.answer_generator.stream_text(
-                request=request,
-                intent=prepared.intent,
-                results=prepared.results,
-            ):
+            if isinstance(self.answer_generator, LLMAnswerGenerator):
+                stream = self.answer_generator.stream_text_with_observation(
+                    request=generation_request,
+                    intent=prepared.intent,
+                    results=prepared.results,
+                    observation=generation_observation,
+                )
+            else:
+                stream = self.answer_generator.stream_text(
+                    request=generation_request,
+                    intent=prepared.intent,
+                    results=prepared.results,
+                )
+            async for piece in stream:
                 if first_token_ms is None:
                     first_token_ms = (perf_counter() - started) * 1000
+                answer_parts.append(piece)
                 yield {"event": "delta", "data": {"content": piece}}
                 await asyncio.sleep(0)
         except asyncio.CancelledError:
+            spans.extend(
+                self._answer_generation_spans(
+                    trace_id=active_trace_id,
+                    parent_span_id=parent_span_id,
+                    request=request,
+                    intent=prepared.intent,
+                    results=prepared.results,
+                    answer="".join(answer_parts),
+                    observation=generation_observation,
+                    generation_latency_ms=_elapsed_ms(generation_started),
+                    status="error",
+                    error_message="client_cancelled",
+                )
+            )
             self._record_trace(
+                request=request,
                 trace_id=active_trace_id,
                 route=route,
                 intent=intent,
@@ -371,11 +758,28 @@ class RagService:
                 streaming=True,
                 first_token_ms=first_token_ms,
                 error_code="client_cancelled",
+                spans=spans,
+                parent_span_id=parent_span_id,
             )
             raise
-        except Exception:
+        except Exception as exc:
             yield _error_event(LLM_PROVIDER_ERROR_MESSAGE, code="llm_provider_error")
+            spans.extend(
+                self._answer_generation_spans(
+                    trace_id=active_trace_id,
+                    parent_span_id=parent_span_id,
+                    request=request,
+                    intent=prepared.intent,
+                    results=prepared.results,
+                    answer="".join(answer_parts) or LLM_PROVIDER_ERROR_MESSAGE,
+                    observation=generation_observation,
+                    generation_latency_ms=_elapsed_ms(generation_started),
+                    status="error",
+                    error_message=str(exc),
+                )
+            )
             self._record_trace(
+                request=request,
                 trace_id=active_trace_id,
                 route=route,
                 intent=intent,
@@ -385,25 +789,64 @@ class RagService:
                 streaming=True,
                 first_token_ms=first_token_ms,
                 error_code="llm_provider_error",
+                spans=spans,
+                parent_span_id=parent_span_id,
             )
             return
 
-        yield _done_event(prepared.citations, refused=False, refusal_reason=None)
+        answer_text = "".join(answer_parts).strip()
+        response = ChatResponse(answer=answer_text, citations=prepared.citations)
+        spans.extend(
+            self._answer_generation_spans(
+                trace_id=active_trace_id,
+                parent_span_id=parent_span_id,
+                request=request,
+                intent=prepared.intent,
+                results=prepared.results,
+                answer=answer_text,
+                observation=generation_observation,
+                generation_latency_ms=_elapsed_ms(generation_started),
+            )
+        )
+        response = response.model_copy(
+            update={
+                "debug": self._debug_info(
+                    trace_id=active_trace_id,
+                    route=route,
+                    intent=prepared.intent,
+                    results=prepared.results,
+                    response=response,
+                    started=started,
+                    first_token_ms=first_token_ms,
+                    spans=spans,
+                )
+            }
+        )
+        yield _done_event(
+            response.citations,
+            refused=False,
+            refusal_reason=None,
+            debug=response.debug,
+        )
         self._record_trace(
+            request=request,
             trace_id=active_trace_id,
             route=route,
-            intent=intent,
+            intent=prepared.intent,
             results=prepared.results,
-            response=ChatResponse(answer="", citations=prepared.citations),
+            response=response,
             started=started,
             streaming=True,
             first_token_ms=first_token_ms,
             error_code=None,
+            spans=spans,
+            parent_span_id=parent_span_id,
         )
 
     def _record_trace(
         self,
         *,
+        request: ChatRequest,
         trace_id: str,
         route: QueryRoute,
         intent: RetrievalIntent | None,
@@ -413,10 +856,28 @@ class RagService:
         streaming: bool,
         first_token_ms: float | None,
         error_code: str | None,
+        spans: Sequence[ObservedSpan] = (),
+        parent_span_id: str | None = None,
     ) -> None:
         if self.trace_sink is None:
             return
         try:
+            total_latency_ms = round((perf_counter() - started) * 1000, 2)
+            all_spans = self._complete_spans(
+                trace_id=trace_id,
+                parent_span_id=parent_span_id or _span_id(trace_id, "agent-root"),
+                request=request,
+                response=response,
+                spans=spans,
+                route=route,
+                intent=intent,
+                total_latency_ms=total_latency_ms,
+                error_code=error_code,
+            )
+            prompt_tokens = sum(span.prompt_tokens for span in all_spans)
+            completion_tokens = sum(span.completion_tokens for span in all_spans)
+            total_tokens = sum(span.total_tokens for span in all_spans)
+            total_cost = sum((span.cost for span in all_spans), Decimal("0"))
             self.trace_sink.record(
                 RagTrace(
                     trace_id=trace_id,
@@ -430,12 +891,223 @@ class RagService:
                     first_token_ms=(
                         round(first_token_ms, 2) if first_token_ms is not None else None
                     ),
-                    total_latency_ms=round((perf_counter() - started) * 1000, 2),
+                    total_latency_ms=total_latency_ms,
                     error_code=error_code,
+                    user_input=request.message,
+                    final_output=response.answer if response else None,
+                    model_name=self._active_model_name(all_spans),
+                    spans=tuple(all_spans),
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=total_tokens,
+                    total_cost=total_cost,
                 )
             )
         except Exception:
             LOGGER.exception("rag_trace_record_failed")
+
+    def _debug_info(
+        self,
+        *,
+        trace_id: str,
+        route: QueryRoute,
+        intent: RetrievalIntent | None,
+        results: Sequence[SearchResult],
+        response: ChatResponse,
+        started: float,
+        first_token_ms: float | None,
+        spans: Sequence[ObservedSpan] = (),
+        error_code: str | None = None,
+    ) -> ChatDebugInfo:
+        return ChatDebugInfo(
+            trace_id=trace_id,
+            route=route,
+            intent=intent.name if intent else None,
+            project_id=intent.project_id if intent else None,
+            generation_strategy=self._generation_strategy(route, intent, response),
+            retrieved_chunk_ids=[result.chunk.chunk_id for result in results],
+            citation_count=len(response.citations),
+            first_token_ms=round(first_token_ms, 2) if first_token_ms is not None else None,
+            total_latency_ms=round((perf_counter() - started) * 1000, 2),
+            model_name=self._active_model_name(spans),
+            refused=response.refused,
+            refusal_reason=response.refusal_reason or error_code,
+        )
+
+    def _complete_spans(
+        self,
+        *,
+        trace_id: str,
+        parent_span_id: str,
+        request: ChatRequest,
+        response: ChatResponse | None,
+        spans: Sequence[ObservedSpan],
+        route: QueryRoute,
+        intent: RetrievalIntent | None,
+        total_latency_ms: float,
+        error_code: str | None,
+    ) -> list[ObservedSpan]:
+        status = "error" if error_code else "success"
+        root_span = _observed_span(
+            trace_id,
+            "agent-root",
+            "agent",
+            "Agent 请求处理",
+            input=_json_payload(
+                {
+                    "message": request.message,
+                    "history": _history_payload(request),
+                    "streaming": response is None and error_code == "client_cancelled",
+                }
+            ),
+            output=response.answer if response else None,
+            status=status,
+            latency_ms=total_latency_ms,
+            metadata={
+                "route": route,
+                "intent": intent.name if intent else None,
+                "refused": response.refused if response else False,
+                "refusal_reason": response.refusal_reason if response else None,
+                "error_code": error_code,
+            },
+        )
+        final_span = _observed_span(
+            trace_id,
+            "agent-final",
+            "agent",
+            "Agent Step：返回最终回答",
+            input=request.message,
+            output=response.answer if response else None,
+            status=status,
+            latency_ms=0,
+            metadata={
+                "citations": [citation.model_dump() for citation in response.citations]
+                if response
+                else [],
+                "refused": response.refused if response else False,
+                "refusal_reason": response.refusal_reason if response else None,
+            },
+            parent_span_id=parent_span_id,
+            error_message=error_code,
+        )
+        return [root_span, *spans, final_span]
+
+    def _answer_generation_spans(
+        self,
+        *,
+        trace_id: str,
+        parent_span_id: str,
+        request: ChatRequest,
+        intent: RetrievalIntent,
+        results: Sequence[SearchResult],
+        answer: str,
+        observation: AnswerGenerationObservation,
+        generation_latency_ms: float,
+        status: str = "success",
+        error_message: str | None = None,
+    ) -> list[ObservedSpan]:
+        if observation.used_policy_answer:
+            return [
+                _observed_span(
+                    trace_id,
+                    "agent-grounded-policy",
+                    "agent",
+                    "Agent Step：边界策略回答",
+                    input=request.message,
+                    output=answer,
+                    status=status,
+                    latency_ms=generation_latency_ms,
+                    metadata={"intent": intent.name},
+                    parent_span_id=parent_span_id,
+                    error_message=error_message,
+                )
+            ]
+
+        if observation.used_llm:
+            messages_payload = _messages_payload(observation.messages)
+            prompt_output = _json_payload(messages_payload)
+            usage = observation.usage
+            cost = self.answer_generator.calculate_cost(usage) if isinstance(
+                self.answer_generator,
+                LLMAnswerGenerator,
+            ) else Decimal("0")
+            prompt_span_id = _span_id(trace_id, "prompt")
+            return [
+                _observed_span(
+                    trace_id,
+                    "prompt",
+                    "prompt",
+                    "构造 RAG Prompt",
+                    input=_json_payload(
+                        {
+                            "message": request.message,
+                            "intent": intent.name,
+                            "retrieved_chunk_ids": [
+                                result.chunk.chunk_id for result in results
+                            ],
+                        }
+                    ),
+                    output=prompt_output,
+                    status=status,
+                    latency_ms=0,
+                    metadata={
+                        "message_count": len(observation.messages),
+                        "source_chunk_count": len(results),
+                    },
+                    parent_span_id=parent_span_id,
+                    error_message=error_message if status == "error" else None,
+                ),
+                _observed_span(
+                    trace_id,
+                    "llm",
+                    "llm",
+                    "调用大模型生成回答",
+                    input=prompt_output,
+                    output=answer,
+                    status=status,
+                    latency_ms=generation_latency_ms,
+                    prompt_tokens=usage.prompt_tokens,
+                    completion_tokens=usage.completion_tokens,
+                    total_tokens=usage.total_tokens,
+                    cost=cost,
+                    metadata={
+                        "model_name": observation.model_name,
+                        "usage_estimated": usage.estimated,
+                        "prompt_span_id": prompt_span_id,
+                    },
+                    parent_span_id=parent_span_id,
+                    error_message=error_message,
+                ),
+            ]
+
+        return [
+            _observed_span(
+                trace_id,
+                "agent-template-generation",
+                "agent",
+                "Agent Step：模板生成回答",
+                input=_json_payload(
+                    {
+                        "message": request.message,
+                        "intent": intent.name,
+                        "retrieved_chunk_ids": [result.chunk.chunk_id for result in results],
+                    }
+                ),
+                output=answer,
+                status=status,
+                latency_ms=generation_latency_ms,
+                metadata={"generation_strategy": "deterministic"},
+                parent_span_id=parent_span_id,
+                error_message=error_message,
+            )
+        ]
+
+    def _active_model_name(self, spans: Sequence[ObservedSpan]) -> str | None:
+        for span in spans:
+            value = span.metadata.get("model_name")
+            if isinstance(value, str) and value:
+                return value
+        return None
 
     def _generation_strategy(
         self,
@@ -455,43 +1127,186 @@ class RagService:
             return "deterministic"
         return type(self.answer_generator).__name__
 
-    def _prepare_answer(self, request: ChatRequest, top_k: int) -> PreparedRagAnswer | ChatResponse:
-        history_text = _history_text(request)
-        route = self.route(request)
-        if route == "restricted":
-            return ChatResponse(
+    def _prepare_answer(
+        self,
+        request: ChatRequest,
+        top_k: int,
+        *,
+        route: QueryRoute | None = None,
+        intent: RetrievalIntent | None = None,
+        trace_id: str | None = None,
+        parent_span_id: str | None = None,
+        spans: list[ObservedSpan] | None = None,
+    ) -> PreparedRagAnswer | ChatResponse:
+        history_text = (
+            _history_text(request) if self._should_use_history_for_current_question(request) else ""
+        )
+        active_route = route or self.route(request)
+        active_trace_id = trace_id or uuid4().hex
+        active_parent_span_id = parent_span_id or _span_id(active_trace_id, "agent-root")
+
+        if active_route == "restricted":
+            response = ChatResponse(
                 answer="这个问题涉及隐藏资料、系统规则或非公开内容，我不能回答。",
                 citations=[],
                 refused=True,
                 refusal_reason="restricted_content",
             )
-        if route == "normal_chat":
-            return ChatResponse(answer=_normal_chat_answer(request.message), citations=[])
-        if route == "out_of_scope":
-            return ChatResponse(answer=_out_of_scope_answer(request.message), citations=[])
+            _append_policy_span(
+                spans,
+                active_trace_id,
+                active_parent_span_id,
+                "Agent Step：安全策略拒答",
+                request.message,
+                response,
+                active_route,
+            )
+            return response
+        if active_route == "normal_chat":
+            response = ChatResponse(answer=_normal_chat_answer(request.message), citations=[])
+            _append_policy_span(
+                spans,
+                active_trace_id,
+                active_parent_span_id,
+                "Agent Step：普通聊天策略回答",
+                request.message,
+                response,
+                active_route,
+            )
+            return response
+        if active_route == "out_of_scope":
+            response = ChatResponse(answer=_out_of_scope_answer(request.message), citations=[])
+            _append_policy_span(
+                spans,
+                active_trace_id,
+                active_parent_span_id,
+                "Agent Step：范围外问题回答",
+                request.message,
+                response,
+                active_route,
+            )
+            return response
 
-        intent = self.intent(request)
-        if intent.name == "generic" and _is_uncovered_personal_fact_question(request.message):
-            return ChatResponse(
+        active_intent = intent or self.intent(request)
+        if active_intent.name == "generic" and _is_uncovered_personal_fact_question(
+            request.message
+        ):
+            response = ChatResponse(
                 answer="当前公开知识库里没有足够证据回答这个问题，我不能凭空补充。",
                 citations=[],
                 refused=True,
                 refusal_reason="insufficient_evidence",
             )
-        retrieval_query = _build_retrieval_query(request.message, history_text, intent)
-        results = self.search_backend.search(retrieval_query, intent, top_k)
-        if not results or not _has_query_anchor_evidence(request.message, intent, results):
-            return ChatResponse(
+            _append_policy_span(
+                spans,
+                active_trace_id,
+                active_parent_span_id,
+                "Agent Step：公开证据边界拒答",
+                request.message,
+                response,
+                active_route,
+            )
+            return response
+
+        retrieval_query = _build_retrieval_query(request.message, history_text, active_intent)
+        retrieval_started = perf_counter()
+        try:
+            results = self.search_backend.search(retrieval_query, active_intent, top_k)
+        except Exception as exc:
+            if spans is not None:
+                spans.append(
+                    _observed_span(
+                        active_trace_id,
+                        "tool-retrieval",
+                        "tool",
+                        "调用知识库检索工具",
+                        input=retrieval_query,
+                        output=None,
+                        status="error",
+                        latency_ms=_elapsed_ms(retrieval_started),
+                        metadata={
+                            "top_k": top_k,
+                            "intent": active_intent.name,
+                            "project_id": active_intent.project_id,
+                        },
+                        parent_span_id=active_parent_span_id,
+                        error_message=str(exc),
+                    )
+                )
+            raise
+
+        if spans is not None:
+            spans.append(
+                _observed_span(
+                    active_trace_id,
+                    "tool-retrieval",
+                    "tool",
+                    "调用知识库检索工具",
+                    input=retrieval_query,
+                    output=_json_payload(_results_payload(results)),
+                    latency_ms=_elapsed_ms(retrieval_started),
+                    metadata={
+                        "top_k": top_k,
+                        "intent": active_intent.name,
+                        "project_id": active_intent.project_id,
+                        "result_count": len(results),
+                    },
+                    parent_span_id=active_parent_span_id,
+                )
+            )
+
+        if not results or not _has_query_anchor_evidence(request.message, active_intent, results):
+            response = ChatResponse(
                 answer="当前公开知识库里没有足够证据回答这个问题，我不能凭空补充。",
                 citations=[],
                 refused=True,
                 refusal_reason="insufficient_evidence",
             )
+            _append_policy_span(
+                spans,
+                active_trace_id,
+                active_parent_span_id,
+                "Agent Step：证据充足性检查",
+                _json_payload(
+                    {
+                        "message": request.message,
+                        "retrieval_query": retrieval_query,
+                        "result_count": len(results),
+                    }
+                ),
+                response,
+                active_route,
+            )
+            return response
 
         results = _select_evidence(results, limit=min(top_k, 6))
 
         citations = _build_citations(results)
-        return PreparedRagAnswer(intent=intent, results=results, citations=citations)
+        if spans is not None:
+            spans.append(
+                _observed_span(
+                    active_trace_id,
+                    "rag-evidence",
+                    "rag",
+                    "整理 RAG 证据",
+                    input=_json_payload(
+                        {
+                            "retrieval_query": retrieval_query,
+                            "selected_chunk_ids": [result.chunk.chunk_id for result in results],
+                        }
+                    ),
+                    output=_json_payload([citation.model_dump() for citation in citations]),
+                    latency_ms=0,
+                    metadata={
+                        "selected_count": len(results),
+                        "document_ids": sorted(
+                            {result.chunk.document_id for result in results}
+                        ),
+                    },
+                    parent_span_id=active_parent_span_id,
+                )
+            )
+        return PreparedRagAnswer(intent=active_intent, results=results, citations=citations)
 
     @staticmethod
     def _is_restricted(message: str) -> bool:
@@ -512,6 +1327,138 @@ def create_rag_service(
     )
 
 
+def _append_policy_span(
+    spans: list[ObservedSpan] | None,
+    trace_id: str,
+    parent_span_id: str,
+    name: str,
+    input_value: str,
+    response: ChatResponse,
+    route: QueryRoute,
+) -> None:
+    if spans is None:
+        return
+    spans.append(
+        _observed_span(
+            trace_id,
+            f"agent-policy-{route}",
+            "agent",
+            name,
+            input=input_value,
+            output=response.answer,
+            status="error" if response.refused else "success",
+            latency_ms=0,
+            metadata={
+                "route": route,
+                "refused": response.refused,
+                "refusal_reason": response.refusal_reason,
+            },
+            parent_span_id=parent_span_id,
+            error_message=response.refusal_reason if response.refused else None,
+        )
+    )
+
+
+def _observed_span(
+    trace_id: str,
+    suffix: str,
+    span_type: str,
+    name: str,
+    *,
+    input: str | None = None,
+    output: str | None = None,
+    status: str = "success",
+    latency_ms: float = 0,
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    total_tokens: int = 0,
+    cost: Decimal = Decimal("0"),
+    metadata: dict[str, object] | None = None,
+    parent_span_id: str | None = None,
+    error_message: str | None = None,
+) -> ObservedSpan:
+    return ObservedSpan(
+        span_id=_span_id(trace_id, suffix),
+        span_type=span_type,
+        name=name,
+        input=input,
+        output=output,
+        status=status,
+        latency_ms=latency_ms,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens or prompt_tokens + completion_tokens,
+        cost=cost,
+        metadata=metadata or {},
+        parent_span_id=parent_span_id,
+        error_message=error_message,
+    )
+
+
+def _span_id(trace_id: str, suffix: str) -> str:
+    return f"{trace_id}:{suffix}"[:100]
+
+
+def _elapsed_ms(started: float) -> float:
+    return round((perf_counter() - started) * 1000, 2)
+
+
+def _json_payload(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, indent=2, default=str)
+
+
+def _history_payload(request: ChatRequest) -> list[dict[str, str]]:
+    return [message.model_dump() for message in request.history]
+
+
+def _intent_payload(intent: RetrievalIntent) -> dict[str, object]:
+    return {
+        "name": intent.name,
+        "project_id": intent.project_id,
+        "allowed_document_ids": list(intent.allowed_document_ids),
+        "expanded_terms": list(intent.expanded_terms),
+        "heading_keywords": list(intent.heading_keywords),
+        "content_keywords": list(intent.content_keywords),
+    }
+
+
+def _results_payload(results: Sequence[SearchResult]) -> list[dict[str, object]]:
+    return [
+        {
+            "chunk_id": result.chunk.chunk_id,
+            "document_id": result.chunk.document_id,
+            "document_title": result.chunk.document_title,
+            "heading_path": list(result.chunk.heading_path),
+            "score": round(result.score, 4),
+            "excerpt": _excerpt(result.chunk.content, 260),
+        }
+        for result in results
+    ]
+
+
+def _messages_payload(messages: Sequence[LLMMessage]) -> list[dict[str, str]]:
+    return [{"role": message.role, "content": message.content} for message in messages]
+
+
+def _estimate_llm_usage(messages: Sequence[LLMMessage], completion: str) -> LLMUsage:
+    prompt_tokens = sum(_estimate_text_tokens(message.content) for message in messages)
+    completion_tokens = _estimate_text_tokens(completion)
+    return LLMUsage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=prompt_tokens + completion_tokens,
+        estimated=True,
+    )
+
+
+def _estimate_text_tokens(text: str) -> int:
+    if not text:
+        return 0
+    cjk_chars = sum(1 for char in text if "\u4e00" <= char <= "\u9fff")
+    non_cjk_chars = max(len(text) - cjk_chars, 0)
+    return max(1, cjk_chars + non_cjk_chars // 4)
+
+
 def _build_citations(results: Sequence[SearchResult]) -> list[Citation]:
     return [
         Citation(
@@ -530,6 +1477,7 @@ def _done_event(
     citations: Sequence[Citation],
     refused: bool,
     refusal_reason: str | None,
+    debug: ChatDebugInfo | None = None,
 ) -> dict[str, Any]:
     return {
         "event": "done",
@@ -538,6 +1486,7 @@ def _done_event(
             "refused": refused,
             "refusal_reason": refusal_reason,
             "citations": [citation.model_dump() for citation in citations],
+            "debug": debug.model_dump() if debug else None,
         },
     }
 
@@ -883,12 +1832,14 @@ def _out_of_scope_answer(question: str) -> str:
         return (
             "抱歉，我不能查询实时天气。这个系统主要用于回答关于周逢森的个人经历、"
             "项目经历、技术能力和职责边界的问题。"
-            "如果你想了解 Skillvar 项目、周逢森的职责、技术难点或项目成果，可以继续提问。"
+            "你可以继续询问他的个人背景、Skillvar、OntoCore、Agentic RAG 个人经历助手、"
+            "技术难点或项目职责。"
         )
     return (
         "抱歉，这个系统不是通用聊天或实时信息查询工具，主要用于了解周逢森的个人经历、"
         "项目经历、技术能力和职责边界。"
-        "你可以询问 Skillvar 项目、实习经历、技术栈、个人贡献或技术难点。"
+        "你可以询问个人背景、Skillvar、OntoCore、Agentic RAG 个人经历助手、"
+        "技术栈、个人贡献或技术难点。"
     )
 
 

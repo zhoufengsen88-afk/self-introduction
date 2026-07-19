@@ -7,7 +7,12 @@ from fastapi.responses import StreamingResponse
 
 from self_intro_api.core.config import get_settings
 from self_intro_api.core.logging import configure_logging
-from self_intro_api.core.observability import LoggingTraceSink
+from self_intro_api.core.observability import (
+    CompositeTraceSink,
+    LiteLLMOpsTraceSink,
+    LoggingTraceSink,
+    TraceSink,
+)
 from self_intro_api.knowledge.scope import load_knowledge_scope
 from self_intro_api.llm.factory import create_llm_provider
 from self_intro_api.rag.pipeline import (
@@ -21,13 +26,45 @@ from self_intro_api.sse import encode_event_stream
 
 configure_logging()
 settings = get_settings()
-trace_sink = LoggingTraceSink()
+
+
+def create_application_trace_sink() -> TraceSink:
+    sinks: list[TraceSink] = [LoggingTraceSink()]
+    if settings.lite_llmops_enabled:
+        if settings.lite_llmops_app_id is None:
+            raise ValueError("LITE_LLMOPS_APP_ID is required when LiteLLMOps is enabled")
+        if settings.lite_llmops_api_key is None:
+            raise ValueError("LITE_LLMOPS_API_KEY is required when LiteLLMOps is enabled")
+
+        api_key = settings.lite_llmops_api_key.get_secret_value()
+        if not api_key:
+            raise ValueError("LITE_LLMOPS_API_KEY cannot be empty when LiteLLMOps is enabled")
+
+        sinks.append(
+            LiteLLMOpsTraceSink(
+                base_url=settings.lite_llmops_base_url,
+                app_id=settings.lite_llmops_app_id,
+                api_key=api_key,
+                model_name=settings.lite_llmops_model_name,
+                timeout_seconds=settings.lite_llmops_timeout_seconds,
+            )
+        )
+    if len(sinks) == 1:
+        return sinks[0]
+    return CompositeTraceSink(sinks)
+
+
+trace_sink = create_application_trace_sink()
 
 
 def create_application_answer_generator() -> DeterministicAnswerGenerator | LLMAnswerGenerator:
     answer_generator = settings.answer_generator.lower().strip()
     if answer_generator == "llm":
-        return LLMAnswerGenerator(create_llm_provider(settings))
+        return LLMAnswerGenerator(
+            create_llm_provider(settings),
+            prompt_cost_per_1k=settings.llm_prompt_cost_per_1k,
+            completion_cost_per_1k=settings.llm_completion_cost_per_1k,
+        )
     if answer_generator == "deterministic":
         return DeterministicAnswerGenerator()
     raise ValueError(f"Unsupported ANSWER_GENERATOR: {settings.answer_generator}")

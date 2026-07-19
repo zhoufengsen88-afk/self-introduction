@@ -363,6 +363,48 @@ async def test_skillvar_project_overview_stays_in_skillvar_scope() -> None:
 
 
 @pytest.mark.asyncio
+async def test_current_project_question_overrides_unrelated_ai_assisted_history() -> None:
+    service = create_rag_service(Path("knowledge"))
+    request = ChatRequest.model_validate(
+        {
+            "message": "请介绍一下你的代表项目 Skillvar。",
+            "history": [
+                {
+                    "role": "user",
+                    "content": (
+                        "Agentic RAG 个人经历助手也用了 Codex 辅助开发，"
+                        "怎么证明这仍然是你的能力？"
+                    ),
+                },
+                {
+                    "role": "assistant",
+                    "content": (
+                        "在 Agentic RAG 个人经历助手项目中，周逢森使用 Codex "
+                        "辅助代码实现、文档整理、测试补充、失败定位和迭代建议。"
+                    ),
+                },
+            ],
+        }
+    )
+
+    response = await service.answer(request)
+    intent = service.intent(request)
+
+    assert response.refused is False
+    assert intent.name == "project_overview"
+    assert intent.project_id == "skillvar"
+    assert "Skillvar 是企业内部 AI Agent Skill 资产平台" in response.answer
+    assert "在 Agentic RAG 个人经历助手项目中" not in response.answer
+    assert {citation.document_id for citation in response.citations} <= {
+        "skillvar-overview",
+        "skillvar-architecture",
+        "skillvar-responsibilities",
+        "skillvar-challenges",
+        "skillvar-results",
+    }
+
+
+@pytest.mark.asyncio
 async def test_rag_answer_uses_expected_responsibility_evidence() -> None:
     service = create_rag_service(Path("knowledge"))
 

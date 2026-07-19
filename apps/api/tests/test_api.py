@@ -33,6 +33,13 @@ async def test_rag_chat_contract() -> None:
     assert payload["citations"][0]["document_id"].startswith("skillvar-")
     assert payload["citations"][0]["heading_path"]
     assert payload["citations"][0]["excerpt"]
+    assert payload["debug"]["trace_id"] == response.headers["X-Trace-ID"]
+    assert payload["debug"]["route"] == "knowledge_rag"
+    assert payload["debug"]["intent"] == "responsibility"
+    assert payload["debug"]["project_id"] == "skillvar"
+    assert payload["debug"]["generation_strategy"] in {"deterministic", "llm"}
+    assert payload["debug"]["citation_count"] == len(payload["citations"])
+    assert payload["debug"]["retrieved_chunk_ids"]
 
 
 @pytest.mark.asyncio
@@ -78,6 +85,9 @@ async def test_rag_chat_stream_contract() -> None:
     done_payload = json.loads(events[-1][1])
     assert done_payload["finish_reason"] == "stop"
     assert done_payload["citations"]
+    assert done_payload["debug"]["trace_id"] == response.headers["X-Trace-ID"]
+    assert done_payload["debug"]["route"] == "knowledge_rag"
+    assert done_payload["debug"]["citation_count"] == len(done_payload["citations"])
 
 
 @pytest.mark.asyncio
@@ -95,3 +105,5 @@ async def test_out_of_scope_stream_has_no_citations() -> None:
     done_payload = json.loads(events[-1][1])
     assert "不能查询实时天气" in answer
     assert done_payload["citations"] == []
+    assert done_payload["debug"]["route"] == "out_of_scope"
+    assert done_payload["debug"]["generation_strategy"] == "route_policy"

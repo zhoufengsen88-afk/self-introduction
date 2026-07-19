@@ -1,4 +1,4 @@
-.PHONY: dev dev-api dev-web install lint test migrate build ingest ingest-db ingest-db-e5 ask ask-db ask-db-e5 eval eval-semantic eval-m35-semantic eval-db eval-db-e5 eval-db-semantic eval-db-semantic-e5 eval-db-m35-semantic eval-db-m35-semantic-e5 eval-m5-llm
+.PHONY: dev dev-api dev-web install lint test migrate build check-knowledge ingest ingest-db ingest-db-e5 ask ask-db ask-db-e5 eval eval-semantic eval-m35-semantic eval-db eval-db-e5 eval-db-semantic eval-db-semantic-e5 eval-db-m35-semantic eval-db-m35-semantic-e5 eval-m5-llm
 
 QUESTION ?= 你在 Skillvar 中具体负责什么？
 EMBEDDING_PROVIDER ?= hashing
@@ -28,7 +28,7 @@ lint:
 	pnpm typecheck:web
 
 test:
-	ANSWER_GENERATOR=deterministic RAG_BACKEND=memory uv run pytest apps/api/tests
+	LITE_LLMOPS_ENABLED=false ANSWER_GENERATOR=deterministic RAG_BACKEND=memory uv run pytest apps/api/tests
 	pnpm test:web
 
 migrate:
@@ -36,6 +36,9 @@ migrate:
 
 build:
 	pnpm build:web
+
+check-knowledge:
+	uv run python -m self_intro_api.cli.check_knowledge --root knowledge
 
 ingest:
 	uv run python -m self_intro_api.cli.ingest

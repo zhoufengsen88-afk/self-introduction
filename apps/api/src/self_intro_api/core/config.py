@@ -17,6 +17,14 @@ class Settings(BaseSettings):
     llm_model: str = ""
     llm_temperature: float = 0.2
     llm_timeout_seconds: float = 30.0
+    llm_prompt_cost_per_1k: float = 0.0
+    llm_completion_cost_per_1k: float = 0.0
+    lite_llmops_enabled: bool = False
+    lite_llmops_base_url: str = "http://127.0.0.1:8001"
+    lite_llmops_app_id: int | None = None
+    lite_llmops_api_key: SecretStr | None = None
+    lite_llmops_model_name: str = "self-introduction-agentic-rag"
+    lite_llmops_timeout_seconds: float = 2.0
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 

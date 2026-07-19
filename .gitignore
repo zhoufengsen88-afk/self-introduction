@@ -24,7 +24,7 @@ coverage/
 # Local handoff / private source-review notes. Public RAG only loads
 # knowledge files with visibility=public and status=published, but these
 # files should also stay out of public GitHub repositories.
-docs/HANDOFF.md
+docs/
 knowledge/projects/*/source-review.md
 
 # Private runtime knowledge corpus. The public repository ships only code,

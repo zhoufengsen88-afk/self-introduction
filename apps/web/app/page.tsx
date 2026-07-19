@@ -1,6 +1,15 @@
 "use client";
 
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type PointerEvent,
+  type TouchEvent,
+  type WheelEvent,
+} from "react";
 import { parseSseFrames, type StreamEvent } from "../lib/sse";
 
 type Citation = {
@@ -12,6 +21,21 @@ type Citation = {
   excerpt: string | null;
 };
 
+type DebugInfo = {
+  trace_id: string | null;
+  route: string;
+  intent: string | null;
+  project_id: string | null;
+  generation_strategy: string;
+  retrieved_chunk_ids: string[];
+  citation_count: number;
+  first_token_ms: number | null;
+  total_latency_ms: number | null;
+  model_name: string | null;
+  refused: boolean;
+  refusal_reason: string | null;
+};
+
 type ChatRole = "user" | "assistant";
 
 type AssistantStatus = "streaming" | "done" | "error" | "stopped";
@@ -21,6 +45,7 @@ type ChatMessage = {
   role: ChatRole;
   content: string;
   citations: Citation[];
+  debug?: DebugInfo | null;
   status?: AssistantStatus;
   refused?: boolean;
   refusalReason?: string | null;
@@ -33,9 +58,19 @@ type ApiHistoryMessage = {
 };
 
 type UiStatus = "idle" | "streaming" | "done" | "error" | "stopped";
-type IntroState = "checking" | "visible" | "hidden";
+type IntroState = "checking" | "visible" | "leaving" | "hidden";
 type IntroPage = {
   eyebrow: string;
+  title: string;
+  description: string;
+};
+type SuggestedQuestion = {
+  id: string;
+  category: "profile" | "projects" | "responsibility" | "engineering";
+  label: string;
+  text: string;
+};
+type FeatureHighlight = {
   title: string;
   description: string;
 };
@@ -45,14 +80,101 @@ const storageKey = "self-introduction-chat-v1";
 const introStorageKey = "self-introduction-intro-seen-v1";
 const textareaMinHeight = 96;
 const textareaMaxHeight = textareaMinHeight * 2;
+const introExitDurationMs = 650;
+const scrollFollowThresholdPx = 80;
 
-const recommendedQuestions = [
-  "请介绍一下你的代表项目 Skillvar。",
-  "你在 Skillvar 中具体负责什么？",
-  "Skillvar 最大的技术难点是什么？",
-  "这个平台怎么把能力交给自动化工具或命令行使用？",
-  "如果 ChromaDB 不可用，检索链路会怎么处理？",
-  "候选人是不是也负责产品规划？",
+const featureHighlights: FeatureHighlight[] = [
+  {
+    title: "知识治理",
+    description: "公开 Markdown 资料经过 Front Matter 校验、Chunk 切分和可见性过滤。",
+  },
+  {
+    title: "证据驱动",
+    description: "回答必须绑定公开证据；资料不足时明确拒答，而不是补编个人事实。",
+  },
+  {
+    title: "工程链路",
+    description: "覆盖 Router、检索、RAG Prompt、SSE 流式输出、评测和 LiteLLMOps 观测。",
+  },
+];
+
+const questionPool: SuggestedQuestion[] = [
+  { id: "profile-name", category: "profile", label: "候选人姓名？", text: "候选人叫什么名字？" },
+  { id: "profile-school", category: "profile", label: "毕业院校？", text: "候选人毕业于哪所大学？" },
+  { id: "profile-stack", category: "profile", label: "主要技术栈？", text: "候选人的主要技术栈是什么？" },
+  { id: "profile-fit", category: "profile", label: "适合岗位？", text: "候选人适合什么方向的岗位？" },
+  {
+    id: "project-skillvar",
+    category: "projects",
+    label: "介绍 Skillvar",
+    text: "请介绍一下代表项目 Skillvar。",
+  },
+  {
+    id: "project-ontocore",
+    category: "projects",
+    label: "介绍 OntoCore",
+    text: "介绍一下 OntoCore 的背景和核心链路。",
+  },
+  {
+    id: "project-self-rag",
+    category: "projects",
+    label: "介绍 AI 助手",
+    text: "介绍一下这个 Agentic RAG 个人经历助手。",
+  },
+  {
+    id: "project-skillvar-features",
+    category: "projects",
+    label: "Skillvar 功能？",
+    text: "Skillvar 有哪些主要功能模块？",
+  },
+  {
+    id: "role-skillvar",
+    category: "responsibility",
+    label: "Skillvar 职责？",
+    text: "候选人在 Skillvar 中具体负责什么？",
+  },
+  {
+    id: "role-ontocore",
+    category: "responsibility",
+    label: "OntoCore 职责？",
+    text: "候选人在 OntoCore 中明确负责哪些链路？",
+  },
+  {
+    id: "role-ontocore-negative",
+    category: "responsibility",
+    label: "OntoCore 边界？",
+    text: "OntoCore 中哪些部分不是候选人负责的？",
+  },
+  {
+    id: "role-product",
+    category: "responsibility",
+    label: "负责产品吗？",
+    text: "候选人是不是也负责产品规划？",
+  },
+  {
+    id: "eng-skillvar-challenge",
+    category: "engineering",
+    label: "Skillvar 难点？",
+    text: "Skillvar 最大的技术难点是什么？",
+  },
+  {
+    id: "eng-ontocore-graph",
+    category: "engineering",
+    label: "图谱难点？",
+    text: "OntoCore 的 Neo4j 知识图谱难点是什么？",
+  },
+  {
+    id: "eng-self-rag-flow",
+    category: "engineering",
+    label: "AI 助手数据流？",
+    text: "这个个人经历 AI 助手的数据流是怎样的？",
+  },
+  {
+    id: "eng-chroma-fallback",
+    category: "engineering",
+    label: "检索降级？",
+    text: "如果 ChromaDB 不可用，检索链路会怎么处理？",
+  },
 ];
 
 const introPages: IntroPage[] = [
@@ -69,10 +191,10 @@ const introPages: IntroPage[] = [
       "你可以询问我的代表项目、实习经历、技术栈、个人贡献、技术难点、项目成果，以及我在团队中的职责边界。",
   },
   {
-    eyebrow: "Evidence-based Answers",
-    title: "回答基于公开证据",
+    eyebrow: "AI-Assisted Development",
+    title: "基于 AI 编程的工程实践",
     description:
-      "系统会先从公开知识库中检索相关资料，再交给大模型生成回答；如果证据不足，会明确说明无法确认，而不是编造答案。",
+      "该项目以 AI 编程为主要开发方式完成，展示候选人借助 AI 工具完成需求拆解、代码实现、调试测试和工程化落地的能力。项目仅用于介绍公开个人经历，不提供商业服务。",
   },
 ];
 
@@ -83,13 +205,23 @@ export default function Home() {
   const [errorMessage, setErrorMessage] = useState("");
   const [introState, setIntroState] = useState<IntroState>("checking");
   const [introPageIndex, setIntroPageIndex] = useState(0);
+  const [suggestedQuestions, setSuggestedQuestions] = useState<SuggestedQuestion[]>(
+    questionPool.slice(0, 3),
+  );
+  const [isNearBottom, setIsNearBottom] = useState(true);
   const abortRef = useRef<AbortController | null>(null);
+  const introExitTimerRef = useRef<number | null>(null);
   const hasLoadedStorageRef = useRef(false);
+  const shouldAutoScrollRef = useRef(true);
+  const userPausedAutoScrollRef = useRef(false);
+  const lastTouchYRef = useRef<number | null>(null);
+  const messageScrollerRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     const bootstrapTimer = window.setTimeout(() => {
+      setSuggestedQuestions(pickSuggestedQuestions());
       try {
         if (window.sessionStorage.getItem(introStorageKey) === "seen") {
           setIntroState("hidden");
@@ -104,6 +236,14 @@ export default function Home() {
 
     return () => {
       window.clearTimeout(bootstrapTimer);
+    };
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (introExitTimerRef.current !== null) {
+        window.clearTimeout(introExitTimerRef.current);
+      }
     };
   }, []);
 
@@ -152,8 +292,10 @@ export default function Home() {
 
   useEffect(() => {
     if (introState !== "hidden") return;
+    if (!shouldAutoScrollRef.current) return;
 
     const frameId = window.requestAnimationFrame(() => {
+      if (!shouldAutoScrollRef.current) return;
       messagesEndRef.current?.scrollIntoView({
         block: "end",
         behavior: status === "streaming" ? "auto" : "smooth",
@@ -176,6 +318,9 @@ export default function Home() {
 
     const controller = new AbortController();
     abortRef.current = controller;
+    shouldAutoScrollRef.current = true;
+    userPausedAutoScrollRef.current = false;
+    setIsNearBottom(true);
     setStatus("streaming");
     setErrorMessage("");
     setDraft("");
@@ -248,6 +393,7 @@ export default function Home() {
             ? {
                 ...message,
                 citations: data.citations,
+                debug: data.debug ?? null,
                 refused: data.refused,
                 refusalReason: data.refusal_reason,
                 status: "done",
@@ -308,19 +454,108 @@ export default function Home() {
 
   function clearChat() {
     abortRef.current?.abort();
+    shouldAutoScrollRef.current = true;
+    userPausedAutoScrollRef.current = false;
+    lastTouchYRef.current = null;
+    setIsNearBottom(true);
     setMessages([]);
     setStatus("idle");
     setErrorMessage("");
     setDraft("");
+    setSuggestedQuestions(pickSuggestedQuestions());
+  }
+
+  function refreshSuggestedQuestions() {
+    if (status === "streaming") return;
+    setSuggestedQuestions((current) => pickSuggestedQuestions(current.map((question) => question.id)));
+  }
+
+  function handleMessagesScroll() {
+    const scroller = messageScrollerRef.current;
+    if (!scroller) return;
+
+    if (userPausedAutoScrollRef.current) {
+      const isAtBottom = isScrollContainerAtBottom(scroller);
+      if (isAtBottom) {
+        userPausedAutoScrollRef.current = false;
+        shouldAutoScrollRef.current = true;
+        setIsNearBottom(true);
+        return;
+      }
+      shouldAutoScrollRef.current = false;
+      setIsNearBottom(false);
+      return;
+    }
+
+    const nextIsNearBottom = isScrollContainerNearBottom(scroller);
+    shouldAutoScrollRef.current = nextIsNearBottom;
+    setIsNearBottom((current) =>
+      current === nextIsNearBottom ? current : nextIsNearBottom,
+    );
+  }
+
+  function pauseAutoScroll() {
+    const scroller = messageScrollerRef.current;
+    if (scroller && !isScrollContainerScrollable(scroller)) return;
+    userPausedAutoScrollRef.current = true;
+    shouldAutoScrollRef.current = false;
+    setIsNearBottom(false);
+  }
+
+  function handleMessagesWheel(event: WheelEvent<HTMLDivElement>) {
+    if (event.deltaY < 0) {
+      pauseAutoScroll();
+    }
+  }
+
+  function handleMessagesTouchStart(event: TouchEvent<HTMLDivElement>) {
+    lastTouchYRef.current = event.touches[0]?.clientY ?? null;
+  }
+
+  function handleMessagesTouchMove(event: TouchEvent<HTMLDivElement>) {
+    const nextTouchY = event.touches[0]?.clientY ?? null;
+    if (lastTouchYRef.current !== null && nextTouchY !== null && nextTouchY > lastTouchYRef.current) {
+      pauseAutoScroll();
+    }
+    lastTouchYRef.current = nextTouchY;
+  }
+
+  function handleMessagesPointerDown(event: PointerEvent<HTMLDivElement>) {
+    const bounds = event.currentTarget.getBoundingClientRect();
+    const isLikelyScrollbarDrag = event.clientX >= bounds.right - 24;
+    if (isLikelyScrollbarDrag) {
+      pauseAutoScroll();
+    }
+  }
+
+  function scrollToBottom(behavior: ScrollBehavior = "smooth") {
+    userPausedAutoScrollRef.current = false;
+    shouldAutoScrollRef.current = true;
+    lastTouchYRef.current = null;
+    setIsNearBottom(true);
+    window.requestAnimationFrame(() => {
+      messagesEndRef.current?.scrollIntoView({
+        block: "end",
+        behavior,
+      });
+    });
   }
 
   function completeIntro() {
+    if (introState === "leaving" || introState === "hidden") return;
     try {
       window.sessionStorage.setItem(introStorageKey, "seen");
     } catch {
       // Ignore storage errors; the intro is purely presentational.
     }
-    setIntroState("hidden");
+    setIntroState("leaving");
+    if (introExitTimerRef.current !== null) {
+      window.clearTimeout(introExitTimerRef.current);
+    }
+    introExitTimerRef.current = window.setTimeout(() => {
+      setIntroState("hidden");
+      introExitTimerRef.current = null;
+    }, introExitDurationMs);
   }
 
   function goToNextIntroPage() {
@@ -332,22 +567,55 @@ export default function Home() {
   }
 
   return (
-    <main className="h-dvh overflow-hidden bg-[radial-gradient(circle_at_top_left,#dbeafe_0,#f8fafc_28rem),linear-gradient(180deg,#f8fafc,#eef2ff)] text-slate-950">
-      <div className="mx-auto flex h-full min-h-0 max-w-5xl flex-col gap-4 px-5 py-5 sm:px-8">
-        <header className="shrink-0">
-          <h1 className="text-2xl font-semibold tracking-tight text-slate-950 sm:text-3xl">
-            个人经历 AI 助手
-          </h1>
-        </header>
+    <main className="relative h-dvh overflow-hidden bg-[radial-gradient(circle_at_top_left,#dbeafe_0,#f8fafc_28rem),linear-gradient(180deg,#f8fafc,#eef2ff)] text-slate-950">
+      <header className="pointer-events-none absolute left-5 top-4 z-10 sm:left-8 sm:top-5">
+        <h1 className="text-base font-semibold tracking-tight text-slate-950 sm:text-lg">
+          个人经历 AI 助手
+        </h1>
+      </header>
 
+      <div className="mx-auto flex h-full min-h-0 max-w-5xl flex-col px-5 py-5 sm:px-8 sm:py-6">
         <div className="min-h-0 flex-1">
-          <section className="grid h-full min-h-0 grid-rows-[minmax(0,1fr)_auto] overflow-hidden rounded-[1.75rem] border border-white/70 bg-white/85 shadow-sm shadow-slate-200/80 backdrop-blur">
-            <div className="grid min-h-0 content-start gap-4 overflow-y-auto overscroll-contain p-4 sm:p-6">
-              {messages.length === 0 ? <EmptyState /> : null}
-              {messages.map((message) => (
-                <MessageBubble key={message.id} message={message} />
-              ))}
-              <div ref={messagesEndRef} aria-hidden="true" />
+          <section className="grid h-full min-h-0 grid-rows-[minmax(0,1fr)_auto] overflow-hidden rounded-[1.75rem] border border-slate-950 bg-white/90 shadow-lg shadow-slate-300/50 backdrop-blur">
+            <div className="relative h-full min-h-0">
+              <div
+                ref={messageScrollerRef}
+                className="grid h-full min-h-0 content-start gap-4 overflow-y-auto overscroll-contain p-4 sm:p-6"
+                onPointerDown={handleMessagesPointerDown}
+                onScroll={handleMessagesScroll}
+                onTouchMove={handleMessagesTouchMove}
+                onTouchStart={handleMessagesTouchStart}
+                onWheel={handleMessagesWheel}
+              >
+                {messages.length === 0 ? <EmptyState /> : null}
+                {messages.map((message) => (
+                  <MessageBubble key={message.id} message={message} />
+                ))}
+                <div ref={messagesEndRef} aria-hidden="true" />
+              </div>
+              {messages.length > 0 && !isNearBottom ? (
+                <button
+                  aria-label="回到底部"
+                  className="absolute bottom-4 right-4 z-10 grid size-11 place-items-center rounded-full border border-white/10 bg-slate-950/90 text-white shadow-xl shadow-slate-900/25 ring-1 ring-slate-700/40 transition hover:bg-slate-900"
+                  type="button"
+                  onClick={() => scrollToBottom()}
+                >
+                  <svg
+                    aria-hidden="true"
+                    className="size-6"
+                    fill="none"
+                    viewBox="0 0 24 24"
+                  >
+                    <path
+                      d="M12 4v15m0 0 7-7m-7 7-7-7"
+                      stroke="currentColor"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth="2"
+                    />
+                  </svg>
+                </button>
+              ) : null}
             </div>
 
             <div className="border-t border-slate-200 bg-white/95 p-4 sm:p-5">
@@ -357,18 +625,28 @@ export default function Home() {
                 </div>
               ) : null}
               <div className="grid gap-3">
-                <div className="flex gap-2 overflow-x-auto pb-1">
-                  {recommendedQuestions.map((question) => (
+                <div className="no-scrollbar flex items-center gap-2 overflow-x-auto">
+                  <span className="shrink-0 text-xs font-medium text-slate-400">你可以试试</span>
+                  {suggestedQuestions.map((question) => (
                     <button
-                      key={question}
-                      className="shrink-0 rounded-full border border-slate-200 bg-white px-3 py-1.5 text-xs text-slate-600 transition hover:border-slate-400 hover:bg-slate-50 hover:text-slate-950 disabled:cursor-not-allowed disabled:opacity-60"
+                      key={question.id}
+                      className="shrink-0 rounded-full border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs text-slate-600 transition hover:border-slate-400 hover:bg-white hover:text-slate-950 disabled:cursor-not-allowed disabled:opacity-60"
                       type="button"
                       disabled={status === "streaming"}
-                      onClick={() => void ask(question)}
+                      title={question.text}
+                      onClick={() => void ask(question.text)}
                     >
-                      {question}
+                      {question.label}
                     </button>
                   ))}
+                  <button
+                    className="shrink-0 rounded-full px-3 py-1.5 text-xs font-medium text-slate-500 transition hover:bg-slate-100 hover:text-slate-950 disabled:cursor-not-allowed disabled:opacity-60"
+                    type="button"
+                    disabled={status === "streaming"}
+                    onClick={refreshSuggestedQuestions}
+                  >
+                    换一批
+                  </button>
                 </div>
                 <label className="sr-only" htmlFor="question">
                   输入问题
@@ -424,9 +702,10 @@ export default function Home() {
           </section>
         </div>
       </div>
-      {introState === "visible" ? (
+      {introState === "visible" || introState === "leaving" ? (
         <IntroOverlay
           currentPage={introPages[introPageIndex]}
+          isLeaving={introState === "leaving"}
           pageIndex={introPageIndex}
           pageCount={introPages.length}
           onNext={goToNextIntroPage}
@@ -439,12 +718,14 @@ export default function Home() {
 
 function IntroOverlay({
   currentPage,
+  isLeaving,
   pageIndex,
   pageCount,
   onNext,
   onSkip,
 }: {
   currentPage: IntroPage;
+  isLeaving: boolean;
   pageIndex: number;
   pageCount: number;
   onNext: () => void;
@@ -456,11 +737,15 @@ function IntroOverlay({
     <div
       aria-label="个人经历 AI 助手介绍"
       aria-modal="true"
-      className="fixed inset-0 z-50 grid place-items-center bg-slate-950 px-6 text-white"
+      className={`fixed inset-0 z-50 grid place-items-center px-6 text-white transition-colors duration-700 ease-out ${
+        isLeaving ? "pointer-events-none bg-transparent" : "bg-slate-950"
+      }`}
       role="dialog"
     >
       <button
-        className="absolute right-5 top-5 rounded-full px-4 py-2 text-sm text-slate-300 transition hover:bg-white/10 hover:text-white"
+        className={`absolute right-5 top-5 rounded-full px-4 py-2 text-sm text-slate-300 transition-all duration-300 hover:bg-white/10 hover:text-white ${
+          isLeaving ? "translate-y-1 opacity-0" : "translate-y-0 opacity-100"
+        }`}
         type="button"
         onClick={onSkip}
       >
@@ -469,7 +754,11 @@ function IntroOverlay({
 
       <section
         key={pageIndex}
-        className="intro-content-in grid max-w-2xl place-items-center gap-7 text-center"
+        className={`grid max-w-2xl place-items-center gap-7 text-center transition-all duration-300 ease-out ${
+          isLeaving
+            ? "translate-y-2 scale-[0.98] opacity-0"
+            : "intro-content-in translate-y-0 scale-100 opacity-100"
+        }`}
       >
         <div className="intro-mark-in grid size-14 place-items-center rounded-2xl bg-white text-lg font-semibold text-slate-950 shadow-2xl shadow-blue-500/20">
           AI
@@ -512,16 +801,31 @@ function IntroOverlay({
 
 function EmptyState() {
   return (
-    <div className="grid min-h-80 place-items-center rounded-3xl border border-dashed border-slate-200 bg-slate-50/80 p-8 text-center">
-      <div className="grid max-w-md gap-3">
-        <div className="mx-auto grid size-12 place-items-center rounded-2xl bg-slate-950 text-lg font-semibold text-white">
+    <div className="grid gap-5 rounded-3xl border border-dashed border-slate-200 bg-slate-50/80 p-5 sm:p-7">
+      <div className="grid gap-3 text-center sm:text-left">
+        <div className="mx-auto grid size-12 place-items-center rounded-2xl bg-slate-950 text-lg font-semibold text-white sm:mx-0">
           AI
         </div>
-        <h2 className="text-xl font-semibold text-slate-950">从一个具体问题开始</h2>
-        <p className="text-sm leading-6 text-slate-500">
-          比如“你在 Skillvar 中具体负责什么？”或者“最大技术难点是什么？”。系统会边生成边返回答案，并在结束后展示引用证据。
-        </p>
+        <div className="grid gap-2">
+          <h2 className="text-2xl font-semibold tracking-tight text-slate-950">
+            从一个可验证的问题开始
+          </h2>
+          <p className="max-w-3xl text-sm leading-6 text-slate-500">
+            这不是通用聊天页，而是一个面试展示型 RAG 应用：系统会从公开知识库检索证据，
+            再生成回答，并在答案底部展示引用、路由、意图和 Trace 摘要。
+          </p>
+        </div>
       </div>
+
+      <div className="grid gap-3 sm:grid-cols-3">
+        {featureHighlights.map((feature) => (
+          <article key={feature.title} className="rounded-2xl border border-white bg-white px-4 py-4 shadow-sm">
+            <h3 className="text-sm font-semibold text-slate-950">{feature.title}</h3>
+            <p className="mt-2 text-xs leading-5 text-slate-500">{feature.description}</p>
+          </article>
+        ))}
+      </div>
+
     </div>
   );
 }
@@ -540,20 +844,31 @@ function MessageBubble({ message }: { message: ChatMessage }) {
         <div className="whitespace-pre-wrap">{message.content || "正在组织公开证据..."}</div>
 
         {!isUser && message.refused ? (
-          <div className="rounded-2xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-800">
-            已拒答：{refusalReasonText(message.refusalReason)}
-          </div>
+          <RefusalNotice reason={message.refusalReason} />
         ) : null}
 
         {!isUser && message.citations.length > 0 ? <CitationList citations={message.citations} /> : null}
+        {!isUser && message.debug ? <DebugPanel debug={message.debug} /> : null}
       </div>
     </article>
   );
 }
 
+function RefusalNotice({ reason }: { reason: string | null | undefined }) {
+  return (
+    <div className="rounded-2xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-800">
+      <div className="font-semibold">已触发知识库边界</div>
+      <p className="mt-1">
+        {refusalReasonText(reason)}
+        你可以换成询问项目职责、技术难点、技术栈、公开经历或职责边界。
+      </p>
+    </div>
+  );
+}
+
 function CitationList({ citations }: { citations: Citation[] }) {
   const [isOpen, setIsOpen] = useState(false);
-  const visibleCitations = citations.slice(0, 6);
+  const visibleCitations = isOpen ? citations.slice(0, 6) : [];
   const hiddenCount = citations.length - visibleCitations.length;
 
   return (
@@ -565,34 +880,94 @@ function CitationList({ citations }: { citations: Citation[] }) {
         onClick={() => setIsOpen((current) => !current)}
       >
         <span className="flex flex-wrap items-center gap-2">
-          <span className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">引用证据</span>
-          <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs text-slate-500">{citations.length} chunks</span>
+          <span className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">公开证据</span>
+          <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs text-slate-500">{citations.length} 条</span>
         </span>
         <span className="text-xs font-medium text-slate-500">{isOpen ? "收起" : "展开"}</span>
       </button>
 
       {isOpen ? (
-        <div className="grid gap-2">
-          {visibleCitations.map((citation) => (
-            <article key={citation.chunk_id} className="rounded-2xl bg-slate-50 px-3 py-3 text-xs leading-5 text-slate-600">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <span className="font-semibold text-slate-800">{citation.document_title}</span>
-                {citation.score !== null ? <span className="text-slate-400">score {citation.score.toFixed(2)}</span> : null}
-              </div>
-              {citation.heading_path.length > 0 ? (
-                <div className="mt-1 text-slate-500">{citation.heading_path.join(" / ")}</div>
-              ) : null}
-              {citation.excerpt ? <p className="mt-2 text-slate-500">{citation.excerpt}</p> : null}
-            </article>
-          ))}
-          {hiddenCount > 0 ? (
-            <div className="rounded-2xl border border-dashed border-slate-200 px-3 py-2 text-xs text-slate-400">
-              还有 {hiddenCount} 条引用证据未展示，当前仅显示最相关的前 {visibleCitations.length} 条。
+      <div className="grid gap-2">
+        {visibleCitations.map((citation) => (
+          <article key={citation.chunk_id} className="rounded-2xl bg-slate-50 px-3 py-3 text-xs leading-5 text-slate-600">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span className="font-semibold text-slate-800">{citation.document_title}</span>
+              {citation.score !== null ? <span className="text-slate-400">score {citation.score.toFixed(2)}</span> : null}
+            </div>
+            {citation.heading_path.length > 0 ? (
+              <div className="mt-1 text-slate-500">{citation.heading_path.join(" / ")}</div>
+            ) : null}
+            {citation.excerpt ? <p className="mt-2 text-slate-500">{citation.excerpt}</p> : null}
+          </article>
+        ))}
+        {hiddenCount > 0 ? (
+          <div className="rounded-2xl border border-dashed border-slate-200 px-3 py-2 text-xs text-slate-400">
+            还有 {hiddenCount} 条公开证据未展示，当前显示最相关的前 {visibleCitations.length} 条。
             </div>
           ) : null}
         </div>
       ) : null}
     </section>
+  );
+}
+
+function DebugPanel({ debug }: { debug: DebugInfo }) {
+  const [isOpen, setIsOpen] = useState(false);
+  const latency = debug.total_latency_ms !== null ? `${debug.total_latency_ms.toFixed(0)} ms` : "未知";
+  const firstToken = debug.first_token_ms !== null ? `${debug.first_token_ms.toFixed(0)} ms` : "未记录";
+
+  return (
+    <section className="grid gap-2 border-t border-slate-100 pt-3">
+      <button
+        aria-expanded={isOpen}
+        className="flex w-full items-center justify-between gap-3 rounded-2xl px-2 py-1.5 text-left transition hover:bg-slate-50"
+        type="button"
+        onClick={() => setIsOpen((current) => !current)}
+      >
+        <span className="flex flex-wrap items-center gap-2">
+          <span className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">调试链路</span>
+          <span className="rounded-full bg-blue-50 px-2 py-0.5 text-xs text-blue-700">
+            {routeText(debug.route)}
+          </span>
+          <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs text-slate-500">
+            {debug.generation_strategy}
+          </span>
+        </span>
+        <span className="text-xs font-medium text-slate-500">{isOpen ? "收起" : "查看"}</span>
+      </button>
+
+      {isOpen ? (
+        <div className="grid gap-2 rounded-2xl bg-slate-50 px-3 py-3 text-xs leading-5 text-slate-600">
+          <DebugRow label="Trace ID" value={debug.trace_id ?? "未记录"} mono />
+          <DebugRow label="Route" value={debug.route} />
+          <DebugRow label="Intent" value={debug.intent ?? "无"} />
+          <DebugRow label="Project" value={debug.project_id ?? "个人资料/未限定项目"} />
+          <DebugRow label="生成策略" value={debug.generation_strategy} />
+          <DebugRow label="首 Token" value={firstToken} />
+          <DebugRow label="总耗时" value={latency} />
+          {debug.model_name ? <DebugRow label="模型" value={debug.model_name} /> : null}
+          <DebugRow label="命中 Chunk" value={`${debug.retrieved_chunk_ids.length} 个`} />
+          {debug.retrieved_chunk_ids.length > 0 ? (
+            <div className="mt-1 flex flex-wrap gap-1.5">
+              {debug.retrieved_chunk_ids.slice(0, 8).map((chunkId) => (
+                <span key={chunkId} className="rounded-full bg-white px-2 py-0.5 font-mono text-[11px] text-slate-500">
+                  {chunkId}
+                </span>
+              ))}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function DebugRow({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {
+  return (
+    <div className="grid grid-cols-[5rem_1fr] gap-3">
+      <span className="text-slate-400">{label}</span>
+      <span className={mono ? "break-all font-mono text-slate-700" : "break-words text-slate-700"}>{value}</span>
+    </div>
   );
 }
 
@@ -611,6 +986,63 @@ function createId(): string {
     return crypto.randomUUID();
   }
   return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function isScrollContainerNearBottom(element: HTMLDivElement): boolean {
+  const distanceToBottom = distanceToScrollContainerBottom(element);
+  return distanceToBottom < scrollFollowThresholdPx;
+}
+
+function isScrollContainerAtBottom(element: HTMLDivElement): boolean {
+  return distanceToScrollContainerBottom(element) < 8;
+}
+
+function isScrollContainerScrollable(element: HTMLDivElement): boolean {
+  return element.scrollHeight > element.clientHeight + 1;
+}
+
+function distanceToScrollContainerBottom(element: HTMLDivElement): number {
+  return element.scrollHeight - element.scrollTop - element.clientHeight;
+}
+
+function pickSuggestedQuestions(previousIds: string[] = [], count = 3): SuggestedQuestion[] {
+  const previous = new Set(previousIds);
+  const categories = shuffleUnique(questionPool.map((question) => question.category));
+  const selected: SuggestedQuestion[] = [];
+
+  for (const category of categories) {
+    const candidates = shuffle(
+      questionPool.filter(
+        (question) =>
+          question.category === category &&
+          !previous.has(question.id) &&
+          !selected.some((selectedQuestion) => selectedQuestion.id === question.id),
+      ),
+    );
+    const candidate = candidates[0];
+    if (candidate) {
+      selected.push(candidate);
+    }
+    if (selected.length >= count) break;
+  }
+
+  const fallback = shuffle(
+    questionPool.filter((question) => !selected.some((selectedQuestion) => selectedQuestion.id === question.id)),
+  );
+  for (const question of fallback) {
+    if (selected.length >= count) break;
+    selected.push(question);
+  }
+
+  return selected;
+}
+
+function shuffleUnique<T extends string>(items: T[]): T[] {
+  return shuffle(Array.from(new Set(items)));
+}
+
+function shuffle<T>(items: T[]): T[] {
+  return [...items].sort(() => Math.random() - 0.5);
 }
 
 function toApiHistory(messages: ChatMessage[]): ApiHistoryMessage[] {
@@ -634,6 +1066,7 @@ function hasDoneData(value: unknown): value is {
   refused: boolean;
   refusal_reason: string | null;
   citations: Citation[];
+  debug?: DebugInfo | null;
 } {
   return (
     typeof value === "object" &&
@@ -669,7 +1102,16 @@ function isStoredMessages(value: unknown): value is ChatMessage[] {
 }
 
 function refusalReasonText(reason: string | null | undefined): string {
-  if (reason === "restricted_content") return "涉及隐藏资料、系统规则或非公开内容";
-  if (reason === "insufficient_evidence") return "公开知识库证据不足";
-  return "当前问题不适合基于公开知识库回答";
+  if (reason === "restricted_content") return "这个问题涉及隐藏资料、系统规则或非公开内容，系统不能回答。";
+  if (reason === "insufficient_evidence") return "公开知识库中没有足够证据确认这一点，系统不会凭空补充。";
+  if (reason === "llm_provider_error") return "大模型调用暂时失败，可以稍后重试或先切换到确定性回答器验证检索链路。";
+  return "当前问题不适合基于公开知识库回答。";
+}
+
+function routeText(route: string): string {
+  if (route === "knowledge_rag") return "知识库 RAG";
+  if (route === "normal_chat") return "普通引导";
+  if (route === "out_of_scope") return "范围外";
+  if (route === "restricted") return "安全拒答";
+  return route;
 }

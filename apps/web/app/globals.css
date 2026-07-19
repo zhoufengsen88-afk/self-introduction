@@ -22,6 +22,14 @@ textarea {
   font: inherit;
 }
 
+.no-scrollbar {
+  scrollbar-width: none;
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
 @keyframes intro-content-in {
   from {
     opacity: 0;

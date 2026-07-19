@@ -22,6 +22,7 @@ async def test_openai_compatible_provider_streams_delta_content() -> None:
         assert request.headers["Authorization"] == "Bearer test-key"
         payload = json.loads(request.content)
         assert payload["model"] == "deepseek-v4-flash"
+        assert payload["stream_options"] == {"include_usage": True}
         return httpx.Response(
             200,
             content=_sse_frames(
@@ -51,3 +52,48 @@ async def test_openai_compatible_provider_streams_delta_content() -> None:
     ]
 
     assert chunks == ["你好", "，面试官"]
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_provider_streams_usage_chunk() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=_sse_frames(
+                iter(
+                    (
+                        {"choices": [{"delta": {"content": "回答"}}]},
+                        {
+                            "choices": [],
+                            "usage": {
+                                "prompt_tokens": 12,
+                                "completion_tokens": 4,
+                                "total_tokens": 16,
+                            },
+                        },
+                        "[DONE]",
+                    )
+                )
+            ),
+            request=request,
+        )
+
+    provider = OpenAICompatibleLLMProvider(
+        base_url="https://example.test/v1",
+        model="deepseek-v4-flash",
+        transport=httpx.MockTransport(handler),
+    )
+
+    chunks = [
+        chunk
+        async for chunk in provider.stream_chat_with_usage(
+            [LLMMessage(role="user", content="Q")]
+        )
+    ]
+
+    assert [chunk.content for chunk in chunks if chunk.content] == ["回答"]
+    usage_chunks = [chunk.usage for chunk in chunks if chunk.usage is not None]
+    assert len(usage_chunks) == 1
+    assert usage_chunks[0].prompt_tokens == 12
+    assert usage_chunks[0].completion_tokens == 4
+    assert usage_chunks[0].total_tokens == 16

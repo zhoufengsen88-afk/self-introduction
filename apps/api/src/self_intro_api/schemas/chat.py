@@ -20,8 +20,24 @@ class Citation(BaseModel):
     excerpt: str | None = None
 
 
+class ChatDebugInfo(BaseModel):
+    trace_id: str | None = None
+    route: str
+    intent: str | None = None
+    project_id: str | None = None
+    generation_strategy: str
+    retrieved_chunk_ids: list[str] = Field(default_factory=list)
+    citation_count: int = 0
+    first_token_ms: float | None = None
+    total_latency_ms: float | None = None
+    model_name: str | None = None
+    refused: bool = False
+    refusal_reason: str | None = None
+
+
 class ChatResponse(BaseModel):
     answer: str
     citations: list[Citation]
     refused: bool = False
     refusal_reason: str | None = None
+    debug: ChatDebugInfo | None = None

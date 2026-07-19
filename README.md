@@ -43,6 +43,7 @@ make lint
 make test
 make migrate
 make build
+make check-knowledge
 make ingest
 make ingest-db
 make ingest-db-e5
@@ -61,12 +62,56 @@ make eval-db-m35-semantic-e5
 make eval-m5-llm
 ```
 
+## 面试展示能力
+
+当前 Web 端不仅提供问答，还会展示几类面试官容易感知的工程能力：
+
+- 首屏说明 RAG 链路：知识治理、检索、RAG Prompt、LLM 生成、引用、拒答和 Trace。
+- 推荐问题按个人背景、项目经历、职责边界、技术深挖分组，避免只围绕单个项目。
+- 每次回答附带公开证据卡片，默认展示最关键证据，可展开查看更多 Chunk。
+- 每次回答附带非敏感调试链路，包括 route、intent、project_id、generation_strategy、Trace ID、命中 Chunk 和延迟。
+- 拒答被视为产品边界能力：公开知识库证据不足、范围外或敏感内容时明确说明，而不是编造答案。
+
 ## 添加新项目知识
 
 复制 `knowledge/projects/_template/`，填写项目文档并将确认可公开的文件设为
 `visibility: public`、`status: published`。Router 会从 `project_id`、标题和可选
 `aliases` 自动识别新项目，不需要修改代码。运行 `make ingest` 可检查动态项目
 注册表；内存模式随后重启 API，pgvector 模式还需重新执行 `make ingest-db-e5`。
+
+添加或替换知识库后，建议先执行：
+
+```bash
+make check-knowledge
+make ingest
+```
+
+`make check-knowledge` 会检查：
+
+- Markdown 是否包含必需 Front Matter：`document_id`、`title`、`category`、`visibility`、`status`、`updated_at`。
+- `visibility` 是否为 `public` 或 `private`，`status` 是否为 `draft` 或 `published`。
+- `document_id` 是否重复。
+- `public + published` 文档正文是否为空。
+- `knowledge/projects/**` 下的公开项目文档是否设置了 `project_id`，否则动态项目路由无法稳定识别。
+
+如果希望别人下载这个仓库后使用自己的知识库，最小流程是：
+
+1. 复制 `knowledge/projects/_template/` 为自己的项目目录。
+2. 填写公开可展示的项目概述、职责、架构、难点、成果和复盘。
+3. 给每份文档设置唯一 `document_id`，同一项目使用相同 `project_id`，并补充 `aliases`。
+4. 只把确认可公开的文件设为 `visibility: public`、`status: published`。
+5. 执行 `make check-knowledge` 和 `make ingest`。
+6. 重启 API；如果使用 pgvector，则执行 `make ingest-db-e5` 后再启动服务。
+
+不建议上传到 GitHub 的内容：
+
+- 原始简历 Word/PDF。
+- 从源码压缩包、内部系统或私有仓库整理出的未脱敏原文。
+- 切分前的私有 Markdown 原文。
+- 评测集中包含隐私、公司内部信息或未公开事实的样例。
+- `.env`、API Key、数据库连接串、LiteLLMOps Key 等配置。
+
+这个仓库更适合作为“RAG 个人经历助手模板 + 工程实现”开源；个人真实知识库可以保留在本地或服务器私有目录中。
 
 数据库迁移需要先启动 PostgreSQL + pgvector：
 

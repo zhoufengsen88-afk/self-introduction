@@ -14,6 +14,20 @@ export type StreamEvent =
           score: number | null;
           excerpt: string | null;
         }>;
+        debug?: {
+          trace_id: string | null;
+          route: string;
+          intent: string | null;
+          project_id: string | null;
+          generation_strategy: string;
+          retrieved_chunk_ids: string[];
+          citation_count: number;
+          first_token_ms: number | null;
+          total_latency_ms: number | null;
+          model_name: string | null;
+          refused: boolean;
+          refusal_reason: string | null;
+        } | null;
       };
     }
   | { event: "error"; data: { message: string; code?: string } }

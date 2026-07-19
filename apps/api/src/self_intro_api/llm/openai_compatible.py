@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import httpx
 
-from self_intro_api.llm.base import LLMMessage
+from self_intro_api.llm.base import LLMMessage, LLMStreamChunk, LLMUsage
 
 
 @dataclass(frozen=True)
@@ -17,6 +17,14 @@ class OpenAICompatibleLLMProvider:
     transport: httpx.AsyncBaseTransport | None = None
 
     async def stream_chat(self, messages: Sequence[LLMMessage]) -> AsyncIterator[str]:
+        async for chunk in self.stream_chat_with_usage(messages):
+            if chunk.content:
+                yield chunk.content
+
+    async def stream_chat_with_usage(
+        self,
+        messages: Sequence[LLMMessage],
+    ) -> AsyncIterator[LLMStreamChunk]:
         if not self.base_url:
             raise ValueError("LLM_BASE_URL is required when ANSWER_GENERATOR=llm")
         if not self.model:
@@ -33,6 +41,7 @@ class OpenAICompatibleLLMProvider:
             ],
             "temperature": self.temperature,
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
         url = f"{self.base_url.rstrip('/')}/chat/completions"
 
@@ -48,9 +57,12 @@ class OpenAICompatibleLLMProvider:
                         continue
                     if chunk == "[DONE]":
                         break
+                    usage = _extract_usage(chunk)
+                    if usage is not None:
+                        yield LLMStreamChunk(usage=usage)
                     content = _extract_delta_content(chunk)
                     if content:
-                        yield content
+                        yield LLMStreamChunk(content=content)
 
 
 def _parse_sse_line(line: str) -> str | None:
@@ -87,3 +99,38 @@ def _extract_delta_content(raw_payload: str) -> str:
         return content if isinstance(content, str) else ""
 
     return ""
+
+
+def _extract_usage(raw_payload: str) -> LLMUsage | None:
+    try:
+        payload = json.loads(raw_payload)
+    except json.JSONDecodeError:
+        return None
+
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        return None
+
+    prompt_tokens = _int_usage_value(usage.get("prompt_tokens"))
+    completion_tokens = _int_usage_value(usage.get("completion_tokens"))
+    total_tokens = _int_usage_value(usage.get("total_tokens"))
+    if total_tokens == 0:
+        total_tokens = prompt_tokens + completion_tokens
+    if prompt_tokens == completion_tokens == total_tokens == 0:
+        return None
+    return LLMUsage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
+        estimated=False,
+    )
+
+
+def _int_usage_value(value: object) -> int:
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return max(value, 0)
+    if isinstance(value, float):
+        return max(int(value), 0)
+    return 0
