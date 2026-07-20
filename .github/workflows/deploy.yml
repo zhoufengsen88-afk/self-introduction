@@ -1,0 +1,72 @@
+name: Deploy self-introduction
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: production-self-introduction
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  APP_DIR: /opt/apps/self-introduction
+  COMPOSE_DIR: /opt/apps/self-introduction/deploy/production
+  SSH_HOST_KEY: 155.133.7.215 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIvCykdHgbrXmIG5psqvVBqL2+pO52F/WHBMI8LP6VA0
+
+jobs:
+  deploy:
+    name: Deploy to Contabo VPS
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install deployment tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rsync openssh-client
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "${{ secrets.VPS_SSH_KEY }}" | tr -d '\r' > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$SSH_HOST_KEY" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Sync self-introduction source
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" "mkdir -p $APP_DIR"
+          rsync -az --delete --delete-delay \
+            --exclude '.git/' \
+            --exclude '.github/' \
+            --exclude '.env' \
+            --exclude 'docs/' \
+            --exclude '.DS_Store' \
+            --exclude 'node_modules/' \
+            --exclude '.next/' \
+            --exclude '.venv/' \
+            --exclude '__pycache__/' \
+            --exclude '.pytest_cache/' \
+            --exclude '.ruff_cache/' \
+            --exclude 'coverage/' \
+            -e "ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes" \
+            ./ "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:$APP_DIR/"
+
+      - name: Rebuild and restart self services
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" 'flock /tmp/portfolio-deploy.lock bash -se' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/apps/self-introduction/deploy/production
+          docker compose up -d --build self-api self-web
+          docker compose ps
+          curl -fsS http://127.0.0.1:8000/healthz
+          curl -fsSI http://127.0.0.1:3000/ >/dev/null
+          REMOTE

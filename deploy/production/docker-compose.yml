@@ -1,0 +1,97 @@
+name: portfolio-stack
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-lite_llmops}
+      POSTGRES_USER: ${POSTGRES_USER:-lite_llmops}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  lite-backend:
+    build:
+      context: /opt/apps/lite-llmops/backend
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-lite_llmops}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-lite_llmops}
+      SQL_ECHO: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  lite-frontend:
+    build:
+      context: /opt/apps/lite-llmops/frontend
+      args:
+        VITE_API_BASE_URL: /llmops/api
+        VITE_BASE_PATH: /llmops/
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${LITE_FRONTEND_PORT:-5173}:80"
+    depends_on:
+      lite-backend:
+        condition: service_healthy
+
+  self-api:
+    build:
+      context: /opt/apps/self-introduction
+      dockerfile: apps/api/Dockerfile
+    restart: unless-stopped
+    environment:
+      APP_ENV: production
+      CORS_ORIGINS: '${SELF_CORS_ORIGINS:-["http://155.133.7.215"]}'
+      RAG_BACKEND: ${RAG_BACKEND:-memory}
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-hashing}
+      ANSWER_GENERATOR: ${ANSWER_GENERATOR:-llm}
+      LLM_PROVIDER: ${LLM_PROVIDER:-openai-compatible}
+      LLM_BASE_URL: ${LLM_BASE_URL:?LLM_BASE_URL is required}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:?LLM_MODEL is required}
+      LLM_TEMPERATURE: ${LLM_TEMPERATURE:-0.2}
+      LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-30}
+      LLM_PROMPT_COST_PER_1K: ${LLM_PROMPT_COST_PER_1K:-0}
+      LLM_COMPLETION_COST_PER_1K: ${LLM_COMPLETION_COST_PER_1K:-0}
+      LITE_LLMOPS_ENABLED: "true"
+      LITE_LLMOPS_BASE_URL: http://lite-backend:8000
+      LITE_LLMOPS_APP_ID: ${LITE_LLMOPS_APP_ID:?LITE_LLMOPS_APP_ID is required}
+      LITE_LLMOPS_API_KEY: ${LITE_LLMOPS_API_KEY:?LITE_LLMOPS_API_KEY is required}
+      LITE_LLMOPS_MODEL_NAME: ${LITE_LLMOPS_MODEL_NAME:-self-introduction-agentic-rag}
+      LITE_LLMOPS_TIMEOUT_SECONDS: ${LITE_LLMOPS_TIMEOUT_SECONDS:-2}
+    volumes:
+      - /opt/apps/lite-llmops/sdk/python:/lite-llmops-sdk:ro
+    ports:
+      - "127.0.0.1:${SELF_API_PORT:-8000}:8000"
+    depends_on:
+      lite-backend:
+        condition: service_healthy
+
+  self-web:
+    build:
+      context: /opt/apps/self-introduction
+      dockerfile: apps/web/Dockerfile
+      args:
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-}
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+    ports:
+      - "127.0.0.1:${SELF_WEB_PORT:-3000}:3000"
+    depends_on:
+      - self-api
+
+volumes:
+  postgres-data:

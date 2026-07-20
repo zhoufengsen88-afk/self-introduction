@@ -1,0 +1,11 @@
+[Unit]
+Description=Portfolio stack PostgreSQL backup
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+Environment=STACK_DIR=/opt/apps/self-introduction/deploy/production
+Environment=BACKUP_DIR=/opt/backups/portfolio-stack/postgres
+Environment=RETENTION_DAYS=14
+ExecStart=/usr/local/sbin/portfolio-postgres-backup
