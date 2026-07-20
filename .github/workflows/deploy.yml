@@ -49,6 +49,7 @@ jobs:
             --exclude '.github/' \
             --exclude '.env' \
             --exclude 'docs/' \
+            --exclude 'knowledge/' \
             --exclude '.DS_Store' \
             --exclude 'node_modules/' \
             --exclude '.next/' \
