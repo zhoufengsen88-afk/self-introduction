@@ -1,4 +1,4 @@
-.PHONY: dev dev-api dev-web install lint test migrate build check-knowledge ingest ingest-db ingest-db-e5 ask ask-db ask-db-e5 eval eval-semantic eval-m35-semantic eval-db eval-db-e5 eval-db-semantic eval-db-semantic-e5 eval-db-m35-semantic eval-db-m35-semantic-e5 eval-m5-llm
+.PHONY: dev dev-api dev-web install lint test test-ci migrate build check-knowledge ingest ingest-db ingest-db-e5 ask ask-db ask-db-e5 eval eval-semantic eval-m35-semantic eval-db eval-db-e5 eval-db-semantic eval-db-semantic-e5 eval-db-m35-semantic eval-db-m35-semantic-e5 eval-m5-llm
 
 QUESTION ?= 你在 Skillvar 中具体负责什么？
 EMBEDDING_PROVIDER ?= hashing
@@ -29,6 +29,30 @@ lint:
 
 test:
 	LITE_LLMOPS_ENABLED=false ANSWER_GENERATOR=deterministic RAG_BACKEND=memory uv run pytest apps/api/tests
+	pnpm test:web
+
+test-ci:
+	LITE_LLMOPS_ENABLED=false ANSWER_GENERATOR=deterministic RAG_BACKEND=memory uv run pytest \
+		apps/api/tests/test_db_repository.py \
+		apps/api/tests/test_embedding.py \
+		apps/api/tests/test_embedding_factory.py \
+		apps/api/tests/test_knowledge_scope.py \
+		apps/api/tests/test_openai_compatible_provider.py \
+		apps/api/tests/test_api.py::test_healthz \
+		apps/api/tests/test_api.py::test_rag_restricted_content_refusal \
+		apps/api/tests/test_api.py::test_out_of_scope_stream_has_no_citations \
+		apps/api/tests/test_eval_llm.py::test_build_summary_keeps_human_review_separate_from_deterministic_checks \
+		apps/api/tests/test_knowledge_rag.py::test_normal_chat_does_not_use_rag_citations \
+		apps/api/tests/test_knowledge_rag.py::test_out_of_scope_question_does_not_use_rag_citations \
+		apps/api/tests/test_knowledge_rag.py::test_candidate_scoped_question_without_evidence_refuses_cleanly \
+		apps/api/tests/test_knowledge_rag.py::test_m53_router_regressions \
+		apps/api/tests/test_knowledge_rag.py::test_m53_unknown_external_credential_refuses_without_citations \
+		apps/api/tests/test_observability.py::test_composite_trace_sink_forwards_to_each_sink \
+		apps/api/tests/test_observability.py::test_lite_llmops_trace_sink_reports_privacy_preserving_summary \
+		apps/api/tests/test_observability.py::test_lite_llmops_trace_sink_reports_detailed_spans \
+		apps/api/tests/test_observability.py::test_insufficient_evidence_trace_has_no_retrieved_chunks \
+		apps/api/tests/test_observability.py::test_normal_chat_stream_records_first_token_and_route_policy \
+		apps/api/tests/test_observability.py::test_trace_sink_failure_does_not_break_chat_response
 	pnpm test:web
 
 migrate:
