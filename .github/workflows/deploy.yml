@@ -64,9 +64,24 @@ jobs:
         run: |
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" 'flock /tmp/portfolio-deploy.lock bash -se' <<'REMOTE'
           set -euo pipefail
+
+          wait_url() {
+            url="$1"
+            attempts="${2:-30}"
+            delay="${3:-2}"
+            for attempt in $(seq 1 "$attempts"); do
+              if curl -fsS "$url" >/dev/null; then
+                return 0
+              fi
+              echo "Waiting for $url ($attempt/$attempts)..."
+              sleep "$delay"
+            done
+            curl -fsS "$url" >/dev/null
+          }
+
           cd /opt/apps/self-introduction/deploy/production
           docker compose up -d --build self-api self-web
           docker compose ps
-          curl -fsS http://127.0.0.1:8000/healthz
-          curl -fsSI http://127.0.0.1:3000/ >/dev/null
+          wait_url http://127.0.0.1:8000/healthz
+          wait_url http://127.0.0.1:3000/
           REMOTE
