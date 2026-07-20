@@ -443,8 +443,12 @@ async def test_out_of_scope_question_does_not_use_rag_citations() -> None:
     ("message", "expected_route"),
     (
         ("你好，你能回答哪些问题？", "normal_chat"),
+        ("你能做些什么？", "normal_chat"),
+        ("个人经历 AI 能做些什么？", "normal_chat"),
+        ("这个助手能帮我了解什么？", "normal_chat"),
         ("谢谢你的介绍。", "normal_chat"),
         ("你使用 Codex 和 GLM-5.2 辅助开发，怎么证明这些工作仍然是你的能力？", "knowledge_rag"),
+        ("你在 Skillvar 中具体负责什么？", "knowledge_rag"),
         ("Skillvar 里的 LLM 翻译和 Skill 生成链路做了什么？", "knowledge_rag"),
         ("你能帮我查今天成都的天气吗？", "out_of_scope"),
         ("帮我翻译一下这段英文。", "out_of_scope"),

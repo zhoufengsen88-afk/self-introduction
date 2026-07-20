@@ -1533,6 +1533,8 @@ def _is_normal_chat_query(
     normalized: str,
     knowledge_scope: KnowledgeScope,
 ) -> bool:
+    if _is_assistant_capability_query(normalized):
+        return True
     if _has_knowledge_scope_signal(question, normalized, knowledge_scope):
         return False
     greetings = {
@@ -1547,7 +1549,6 @@ def _is_normal_chat_query(
         "辛苦了",
         "你是谁",
         "你是什么",
-        "你能做什么",
         "怎么使用",
         "如何使用",
         "可以问什么",
@@ -1560,14 +1561,77 @@ def _is_normal_chat_query(
     return any(
         phrase in normalized
         for phrase in (
-            "你可以做什么",
-            "你能回答什么",
-            "你能回答哪些",
-            "你可以回答什么",
-            "你可以回答哪些",
             "这个系统是干嘛的",
-            "这个系统能做什么",
         )
+    )
+
+
+def _is_assistant_capability_query(normalized: str) -> bool:
+    exact_queries = {
+        "你能做什么",
+        "你能做些什么",
+        "你可以做什么",
+        "你可以做些什么",
+        "你都能做什么",
+        "你能干什么",
+        "你可以干什么",
+        "你能帮我做什么",
+        "你能帮我了解什么",
+        "你能回答什么",
+        "你能回答哪些",
+        "你可以回答什么",
+        "你可以回答哪些",
+        "我可以问什么",
+        "我能问什么",
+        "可以问什么",
+        "能问什么",
+        "怎么使用",
+        "如何使用",
+    }
+    if normalized in exact_queries:
+        return True
+    direct_phrases = (
+        "你能回答哪些问题",
+        "你可以回答哪些问题",
+        "你能回答什么问题",
+        "你可以回答什么问题",
+        "我可以问你什么",
+        "我能问你什么",
+    )
+    if any(phrase in normalized for phrase in direct_phrases):
+        return True
+
+    assistant_subjects = (
+        "这个系统",
+        "这个助手",
+        "这个ai",
+        "ai助手",
+        "个人经历ai",
+        "个人经历助手",
+        "简历助手",
+        "问答系统",
+    )
+    capability_phrases = (
+        "能做什么",
+        "能做些什么",
+        "可以做什么",
+        "可以做些什么",
+        "能干什么",
+        "可以干什么",
+        "能帮我做什么",
+        "能帮我了解什么",
+        "能回答什么",
+        "能回答哪些",
+        "可以回答什么",
+        "可以回答哪些",
+        "可以问什么",
+        "能问什么",
+        "怎么使用",
+        "如何使用",
+        "是干嘛的",
+    )
+    return any(subject in normalized for subject in assistant_subjects) and any(
+        phrase in normalized for phrase in capability_phrases
     )
 
 
@@ -1820,8 +1884,11 @@ def _normal_chat_answer(question: str) -> str:
     if normalized.startswith(("谢谢", "感谢", "辛苦了")):
         return "不客气。你可以继续询问周逢森的项目经历、技术能力、个人贡献、技术难点或职责边界。"
     return (
-        "你好，我是个人经历 AI 助手。你可以询问周逢森的代表项目、实习经历、技术栈、"
-        "项目经历、技术能力、个人贡献、技术难点、项目成果，以及他在团队中的职责边界。"
+        "你好，我是个人经历 AI 助手，主要帮助面试官了解周逢森的公开个人经历。"
+        "你可以询问他的个人背景、求职方向、技术栈、实习经历、代表项目、个人贡献、"
+        "技术难点、项目成果和职责边界。例如可以问："
+        "“他在 Skillvar 中具体负责什么？”“这个 Agentic RAG 项目有什么亮点？”"
+        "“他的主要技术栈是什么？”"
     )
 
 
