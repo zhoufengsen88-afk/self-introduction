@@ -568,12 +568,6 @@ export default function Home() {
 
   return (
     <main className="relative h-dvh overflow-hidden bg-[radial-gradient(circle_at_top_left,#dbeafe_0,#f8fafc_28rem),linear-gradient(180deg,#f8fafc,#eef2ff)] text-slate-950">
-      <header className="pointer-events-none absolute left-5 top-4 z-10 sm:left-8 sm:top-5">
-        <h1 className="text-base font-semibold tracking-tight text-slate-950 sm:text-lg">
-          个人经历 AI 助手
-        </h1>
-      </header>
-
       <div className="mx-auto flex h-full min-h-0 max-w-5xl flex-col px-5 py-5 sm:px-8 sm:py-6">
         <div className="min-h-0 flex-1">
           <section className="grid h-full min-h-0 grid-rows-[minmax(0,1fr)_auto] overflow-hidden rounded-[1.75rem] border border-slate-950 bg-white/90 shadow-lg shadow-slate-300/50 backdrop-blur">
